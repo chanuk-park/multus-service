@@ -18,6 +18,7 @@ import (
 
 	"github.com/boanlab/multus-service/internal/agent/local"
 	agentnetns "github.com/boanlab/multus-service/internal/agent/netns"
+	"github.com/boanlab/multus-service/internal/agent/probe"
 	"github.com/boanlab/multus-service/internal/attach"
 	"github.com/boanlab/multus-service/internal/model"
 	"github.com/boanlab/multus-service/internal/multus"
@@ -29,10 +30,12 @@ const (
 	// PathNone emits no path state. Endpoints then stay not-ready, which is
 	// correct: nothing has checked whether the address is reachable.
 	PathNone = "none"
-	// PathAssumeReady reports every path as up without probing. A Phase 3
-	// scaffold for exercising the transport end to end; replaced by the real
-	// probe in Phase 4.
+	// PathAssumeReady reports every path as up without probing. A scaffold for
+	// exercising the transport end to end. It is synthetic and must never
+	// appear in evaluation results, which --evaluation-mode enforces.
 	PathAssumeReady = "assume-ready"
+	// PathICMP probes the real secondary datapath.
+	PathICMP = "icmp"
 )
 
 // Agent observes every secondary attachment belonging to a managed Service
@@ -48,12 +51,15 @@ type Agent struct {
 	// Resync bounds how long a missed netlink event can go unnoticed.
 	Resync time.Duration
 
-	// PathMode is a Phase 3 stand-in for the active probe that arrives in
-	// Phase 4. "assume-ready" emits an Endpoint-scope PathHealth that is always
-	// true, which exercises the transport and the join without claiming to have
-	// measured anything. The default emits no path state at all, so endpoints
-	// stay not-ready -- the honest answer while nothing probes the path.
+	// PathMode selects where path state comes from: nothing, a synthetic
+	// stand-in, or a real probe.
 	PathMode string
+
+	// Probes runs the active probe loop when PathMode is PathICMP.
+	Probes *probe.Manager
+
+	// ProbeTimeout bounds one sample.
+	ProbeTimeout time.Duration
 
 	mu   sync.Mutex
 	prev map[string]bool // attachment ID -> last reported local_ready
@@ -85,8 +91,23 @@ func (a *Agent) Start(ctx context.Context) error {
 			// sweep covers the whole burst.
 			drain(a.Monitor.Events())
 			a.sweep(ctx)
+		case <-a.probeWake():
+			// A path state moved. Report it now rather than at the next resync:
+			// the probe interval and the hysteresis thresholds already cost
+			// time, and adding the sweep period on top would hide where the
+			// latency actually goes.
+			a.sweep(ctx)
 		}
 	}
+}
+
+// probeWake yields the probe manager's wake channel, or nil when no probe runs.
+// A nil channel blocks for ever in a select, which is exactly right here.
+func (a *Agent) probeWake() <-chan struct{} {
+	if a.Probes == nil {
+		return nil
+	}
+	return a.Probes.Wake()
 }
 
 func drain(ch <-chan string) {
@@ -119,6 +140,8 @@ func (a *Agent) sweep(ctx context.Context) {
 	live := map[string]bool{}
 	changed := map[string]bool{}
 	locals := make([]model.LocalHealth, 0, len(atts))
+	specs := make([]probe.Spec, 0, len(atts))
+	probeCfg := map[string]attach.ProbeConfig{}
 	now := time.Now()
 
 	for _, at := range atts {
@@ -170,6 +193,35 @@ func (a *Agent) sweep(ctx context.Context) {
 		live[r.AttachmentID] = true
 		locals = append(locals, r)
 
+		if a.PathMode == PathICMP {
+			cfg, ok := probeCfg[at.NAD]
+			if !ok {
+				cfg = a.probeConfig(ctx, at.NAD)
+				probeCfg[at.NAD] = cfg
+			}
+			// A network that declares no health target has not opted into path
+			// probing. No sample is invented for it; the controller's
+			// NoPathReport is the accurate answer.
+			if cfg.Configured() && link.Exists {
+				iface := at.Interface
+				if cfg.SourceInterface != "" {
+					iface = cfg.SourceInterface
+				}
+				specs = append(specs, probe.Spec{
+					ScopeKey:     r.AttachmentID,
+					Scope:        model.ScopeEndpoint,
+					NAD:          at.NAD,
+					AttachmentID: r.AttachmentID,
+					PodName:      at.PodName,
+					NetnsPath:    h.Path,
+					Interface:    iface,
+					SourceIP:     at.IP,
+					Target:       cfg.Target,
+					Timeout:      a.ProbeTimeout,
+				})
+			}
+		}
+
 		if a.transition(r, h) {
 			changed[r.AttachmentID] = true
 		}
@@ -189,7 +241,8 @@ func (a *Agent) sweep(ctx context.Context) {
 	// An empty path list still means "everything this node currently knows",
 	// which is what makes the controller's atomic snapshot replacement correct.
 	var paths []model.PathHealth
-	if a.PathMode == PathAssumeReady {
+	switch a.PathMode {
+	case PathAssumeReady:
 		paths = make([]model.PathHealth, 0, len(locals))
 		for _, r := range locals {
 			paths = append(paths, model.PathHealth{
@@ -200,6 +253,14 @@ func (a *Agent) sweep(ctx context.Context) {
 				PathReady:  true,
 				ObservedAt: now,
 			})
+		}
+	case PathICMP:
+		if a.Probes != nil {
+			a.Probes.SetTargets(specs)
+			paths = a.Probes.States()
+			for k := range a.Probes.TakeChanged() {
+				changed[k] = true
+			}
 		}
 	}
 
@@ -272,6 +333,27 @@ func (a *Agent) retire(live map[string]bool, handles map[string]agentnetns.Handl
 		}
 	}
 	return gone
+}
+
+// probeConfig reads the probe contract off the NAD. A failure is reported as
+// "not configured" rather than guessed at: probing the wrong target would
+// produce a confident answer about the wrong thing.
+func (a *Agent) probeConfig(ctx context.Context, nad string) attach.ProbeConfig {
+	ns, name, err := attach.SplitNAD(nad)
+	if err != nil {
+		return attach.ProbeConfig{}
+	}
+	u := attach.NewNAD()
+	if err := a.Client.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, u); err != nil {
+		log.FromContext(ctx).V(1).Info("reading NAD", "nad", nad, "err", err.Error())
+		return attach.ProbeConfig{}
+	}
+	cfg, err := attach.ProbeFromNAD(u)
+	if err != nil {
+		log.FromContext(ctx).V(1).Info("probe config", "nad", nad, "err", err.Error())
+		return attach.ProbeConfig{}
+	}
+	return cfg
 }
 
 // targets returns every attachment on this node that a managed Service claims.

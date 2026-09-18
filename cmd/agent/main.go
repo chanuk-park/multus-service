@@ -26,6 +26,7 @@ import (
 	"github.com/boanlab/multus-service/internal/agent"
 	"github.com/boanlab/multus-service/internal/agent/local"
 	agentnetns "github.com/boanlab/multus-service/internal/agent/netns"
+	"github.com/boanlab/multus-service/internal/agent/probe"
 	"github.com/boanlab/multus-service/internal/obs"
 )
 
@@ -44,6 +45,11 @@ func main() {
 		ctrlAddr   string
 		refresh    time.Duration
 		pathMode   string
+		probeEvery time.Duration
+		probeWait  time.Duration
+		failK      int
+		successM   int
+		evalMode   bool
 	)
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"),
 		"name of the node this agent observes; usually injected via the downward API")
@@ -58,8 +64,22 @@ func main() {
 	flag.StringVar(&ctrlAddr, "controller-address", os.Getenv("CONTROLLER_ADDRESS"),
 		"controller health transport, host:port; empty observes locally without reporting")
 	flag.StringVar(&pathMode, "path-probe", agent.PathNone,
-		"path state source: none (Phase 3 default) or assume-ready "+
-			"(scaffold that reports every path up without probing; the real probe lands in Phase 4)")
+		"path state source: none | icmp | assume-ready. "+
+			"assume-ready is a synthetic scaffold that reports every path up without probing")
+	flag.DurationVar(&probeEvery, "probe-interval", 500*time.Millisecond,
+		"how often each path is sampled")
+	flag.DurationVar(&probeWait, "probe-timeout", 400*time.Millisecond,
+		"how long one sample waits for a reply. Keep it below --probe-interval: a "+
+			"failing path fails by timing out, and a timeout longer than the interval "+
+			"stretches the effective sampling period and with it the time the failure "+
+			"thresholds take to trip")
+	flag.IntVar(&failK, "failure-threshold", 3,
+		"consecutive failed samples before a path is declared down")
+	flag.IntVar(&successM, "success-threshold", 2,
+		"consecutive successful samples before a path is declared up again")
+	flag.BoolVar(&evalMode, "evaluation-mode", false,
+		"refuse to start with a synthetic path source, so measurement runs cannot "+
+			"silently report numbers the system never measured")
 	flag.DurationVar(&refresh, "refresh", 1*time.Second,
 		"how often the full state is resent regardless of change; must stay well under the controller's health TTL")
 
@@ -72,6 +92,20 @@ func main() {
 
 	if nodeName == "" {
 		setupLog.Error(nil, "--node-name or NODE_NAME is required")
+		os.Exit(1)
+	}
+	// A synthetic path source produces plausible, entirely made-up convergence
+	// numbers. Refusing to start is cheaper than discovering later that a graph
+	// was drawn from them.
+	if evalMode && pathMode != agent.PathICMP {
+		setupLog.Error(nil, "--evaluation-mode requires a real path probe",
+			"path-probe", pathMode, "want", agent.PathICMP)
+		os.Exit(1)
+	}
+	switch pathMode {
+	case agent.PathNone, agent.PathAssumeReady, agent.PathICMP:
+	default:
+		setupLog.Error(nil, "unknown --path-probe", "value", pathMode)
 		os.Exit(1)
 	}
 
@@ -95,6 +129,9 @@ func main() {
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAdr},
 		HealthProbeBindAddress: probeAddr,
+		// NetworkAttachmentDefinitions are read as unstructured objects; without
+		// this they would be fetched from the API server on every sweep.
+		Client: client.Options{Cache: &client.CacheOptions{Unstructured: true}},
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				// Only this node's Pods are ever relevant, and on a large
@@ -134,14 +171,24 @@ func main() {
 	}
 
 	a := &agent.Agent{
-		Client:   mgr.GetClient(),
-		NodeName: nodeName,
-		Resolver: agentnetns.NewCache(resolver),
-		Monitor:  local.NewMonitor(256),
-		Sink:     sink,
-		Events:   events,
-		Resync:   resync,
-		PathMode: pathMode,
+		Client:       mgr.GetClient(),
+		NodeName:     nodeName,
+		Resolver:     agentnetns.NewCache(resolver),
+		Monitor:      local.NewMonitor(256),
+		Sink:         sink,
+		Events:       events,
+		Resync:       resync,
+		PathMode:     pathMode,
+		ProbeTimeout: probeWait,
+	}
+
+	if pathMode == agent.PathICMP {
+		pm := probe.NewManager(probe.NewICMPProber(), probeEvery, failK, successM, nodeName, events)
+		if err := mgr.Add(pm); err != nil {
+			setupLog.Error(err, "registering probe manager")
+			os.Exit(1)
+		}
+		a.Probes = pm
 	}
 	if err := a.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "registering agent")

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Phase 3 acceptance: gRPC health transport, stale-report rejection, resync.
+# Phase 3 acceptance: gRPC health transport, snapshots, stale-report rejection.
 #
-# The agent runs with --path-probe=assume-ready, a scaffold that asserts path
-# state instead of measuring it. That is what lets an endpoint reach ready=true
-# before Phase 4 exists; nothing here claims the path was actually probed.
-set -uo pipefail
+# The fixture declares a real health target, so readiness here is reached the
+# same way it is in production: local state from netlink and path state from an
+# actual probe. Nothing in the acceptance suite depends on the assume-ready
+# scaffold.
+#
+# No pipefail: `grep -q` exits on first match and SIGPIPEs its upstream stage,
+# which under pipefail turns a successful assertion into a failed pipeline --
+# intermittently, depending on whether the upstream had finished writing.
+set -u
 
 NS=${NS:-ms-e2e3}
 SVC=${SVC:-amf-p3}
@@ -31,6 +36,10 @@ retry() {
   done
 }
 k() { kubectl -n "$NS" "$@"; }
+agent_pod() {
+  kubectl -n "$CTRL_NS" get pod -l app="$AGENT_DS" \
+    --field-selector spec.nodeName="$NODE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+}
 clog() { kubectl -n "$CTRL_NS" logs deploy/"$CTRL" --tail="${1:-4000}" 2>/dev/null; }
 # The controller emits a report event per attachment per second, so a tail
 # window can scroll past a one-off event. Time-bounded reads avoid that.
@@ -46,21 +55,36 @@ for e in json.load(sys.stdin):
         print(e['$1'] if '$1' != 'ip' else e['ips'][0]); break"
 }
 
-PF_PID=""
-start_pf() {
-  kubectl -n "$CTRL_NS" port-forward deploy/"$CTRL" 19090:9090 >/dev/null 2>&1 &
-  PF_PID=$!
-  retry 30 'bash -c "exec 3<>/dev/tcp/127.0.0.1/19090" 2>/dev/null'
+# The controller's gRPC Service is a ClusterIP, which kube-proxy makes reachable
+# from the node. Port-forward was used here first and proved unreliable: it
+# accepts the local connection before it has a working path to the pod, so a
+# forward that is about to die looks identical to one that is up -- and a dead
+# forward reads as a rejection that never fired.
+CTRL_ADDR=""
+resolve_ctrl() {
+  CTRL_ADDR="$(kubectl -n "$CTRL_NS" get svc "$CTRL" -o jsonpath='{.spec.clusterIP}' 2>/dev/null):9090"
+  retry 60 'bash -c "exec 3<>/dev/tcp/'"${CTRL_ADDR%:*}"'/9090" 2>/dev/null' \
+    || { bad "controller health transport unreachable at $CTRL_ADDR"; return 1; }
 }
-stop_pf() { [ -n "$PF_PID" ] && kill "$PF_PID" 2>/dev/null; PF_PID=""; sleep 1; }
 
+HARNESS_LOG=$(mktemp)
 harness() {
-  ( cd "$ROOT" && go run ./test/tools/healthreport --addr 127.0.0.1:19090 --node "$NODE" "$@" ) >/dev/null 2>&1
+  local inst=""
+  for a in "$@"; do [ "$prev" = "--instance" ] && inst=$a; prev=$a; done
+  ( cd "$ROOT" && go run ./test/tools/healthreport --addr "$CTRL_ADDR" --node "$NODE" "$@" ) \
+    > "$HARNESS_LOG" 2>&1
+  # Without confirming the connection, a port-forward that never came up is
+  # indistinguishable from a rejection that never fired.
+  if [ -n "$inst" ] && ! retry 30 'clog_since 120s | grep "\"event\":\"agent_connected\"" | grep -q "\"agent_instance\":\"'"$inst"'\""'; then
+    bad "harness never connected as $inst" "$(tail -3 "$HARNESS_LOG")"
+    return 1
+  fi
+  return 0
 }
+prev=""
 
 cleanup() {
   head_ "cleanup"
-  stop_pf
   kubectl -n "$CTRL_NS" patch ds "$AGENT_DS" --type=json \
     -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]' >/dev/null 2>&1
   kubectl delete ns "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
@@ -69,6 +93,13 @@ cleanup() {
 trap cleanup EXIT
 
 head_ "setup"
+if [ -z "$(agent_pod)" ]; then
+  echo "  waiting for a node agent on $NODE"
+  retry 240 '[ -n "$(agent_pod)" ]' || { bad "no agent pod on $NODE -- deploy the DaemonSet first"; exit 1; }
+fi
+retry 240 '[ "$(kubectl -n "$CTRL_NS" get pod "$(agent_pod)" -o jsonpath="{.status.phase}" 2>/dev/null)" = "Running" ]' \
+  || { bad "agent on $NODE never became Running"; exit 1; }
+echo "  agent: $(agent_pod) on $NODE"
 if kubectl get ns "$NS" >/dev/null 2>&1; then
   kubectl delete ns "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
   retry 180 '! kubectl get ns "$NS" >/dev/null 2>&1' || { bad "namespace stuck terminating"; exit 1; }
@@ -79,9 +110,27 @@ kubectl create ns "$NS" >/dev/null
 cat <<EOP | kubectl apply -f - >/dev/null
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
-metadata: {name: sec-p3, namespace: $NS}
+metadata:
+  name: sec-p3
+  namespace: $NS
+  annotations:
+    secondary-service.boanlab.io/probe-scope: endpoint
+    secondary-service.boanlab.io/health-target: "10.213.0.200"
 spec:
   config: '{"cniVersion":"0.3.1","name":"sec-p3","plugins":[{"type":"macvlan","master":"mslab0","mode":"bridge","ipam":{"type":"host-local","ranges":[[{"subnet":"10.213.0.0/24","rangeStart":"10.213.0.10","rangeEnd":"10.213.0.99"}]]}}]}'
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata: {name: sec-p3-target, namespace: $NS}
+spec:
+  config: '{"cniVersion":"0.3.1","name":"sec-p3-target","plugins":[{"type":"macvlan","master":"mslab0","mode":"bridge","ipam":{"type":"static","addresses":[{"address":"10.213.0.200/24"}]}}]}'
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: p3-target, namespace: $NS, annotations: {k8s.v1.cni.cncf.io/networks: sec-p3-target}}
+spec:
+  nodeSelector: {kubernetes.io/hostname: $NODE}
+  containers: [{name: sh, image: docker.io/library/busybox:1.36, command: ["sh","-c","sleep infinity"]}]
 ---
 apiVersion: v1
 kind: Service
@@ -119,8 +168,10 @@ spec:
   containers: [{name: sh, image: docker.io/library/busybox:1.36, command: ["sh","-c","sleep infinity"]}]
 EOP
 
-retry 180 '[ "$(k get pod -l app=p3 --no-headers 2>/dev/null | grep -c Running)" = "1" ]' \
+retry 240 '[ "$(k get pod -l app=p3 --no-headers 2>/dev/null | grep -c Running)" = "1" ]' \
   || { bad "workload never started"; exit 1; }
+retry 240 '[ "$(k get pod p3-target -o jsonpath="{.status.phase}" 2>/dev/null)" = "Running" ]' \
+  || { bad "health target never started"; exit 1; }
 retry 120 '[ "$(k get pod dnsprobe -o jsonpath="{.status.phase}" 2>/dev/null)" = "Running" ]' >/dev/null
 PODUID=$(k get pod -l app=p3 -o jsonpath='{.items[0].metadata.uid}')
 retry 90 '[ -n "$(clog | grep "\"event\":\"attachment_discovered\"" | grep "\"pod_uid\":\"'"$PODUID"'\"" | tail -1)" ]' >/dev/null
@@ -152,9 +203,9 @@ head_ "P3-2 알 수 없는 attachment_id report 거부 (Agent 는 discovery auth
 # The real agent cannot produce this: it derives its targets from the same
 # objects the controller does, so the two converge before a bad report exists.
 # The harness claims the node with its own instance id and sends one on purpose.
-start_pf
+resolve_ctrl
 harness --instance harness-unknown --case unknown-attachment
-if retry 60 'clog | grep "\"event\":\"health_report_rejected\"" | grep -q "unknown attachment"'; then
+if retry 60 'clog_since 120s | grep "\"event\":\"health_report_rejected\"" | grep -q "unknown attachment"'; then
   ok "report naming an attachment the registry never derived was rejected"
 else
   bad "unknown-attachment report was not rejected"
@@ -164,22 +215,20 @@ if k get endpointslice "$SLICE" -o jsonpath='{.endpoints[*].addresses[0]}' 2>/de
 else
   ok "no endpoint appeared for the invented attachment"
 fi
-stop_pf
 retry 120 'slice_ready | grep -q "=true"' >/dev/null \
   && ok "the superseded real agent reconnected and readiness returned" \
   || bad "readiness did not return after the harness disconnected" "$(slice_ready)"
 
 # ---------------------------------------------------------------- P3-3
 head_ "P3-3 이전 sequence report 무시"
-start_pf
+resolve_ctrl
 harness --instance harness-order --case out-of-order \
         --attachment "$AID" --nad "$NS/sec-p3" --interface "$IFACE" --ip "$IP"
-if retry 60 'clog | grep "\"event\":\"health_report_rejected\"" | grep -q "sequence did not advance"'; then
+if retry 60 'clog_since 120s | grep "\"event\":\"health_report_rejected\"" | grep -q "sequence did not advance"'; then
   ok "a replayed sequence was rejected rather than applied"
 else
   bad "out-of-order report was not rejected"
 fi
-stop_pf
 retry 120 'slice_ready | grep -q "=true"' >/dev/null \
   && ok "readiness returned after the harness disconnected" \
   || bad "readiness did not return" "$(slice_ready)"
@@ -256,14 +305,13 @@ fi
 
 # ---------------------------------------------------------------- P3-8
 head_ "P3-8 Node scope PathHealth 공유 / 범위 밖 key 거부"
-start_pf
+resolve_ctrl
 harness --instance harness-scope --case node-scope-path --nad "$NS/sec-p3"
-if retry 60 'clog | grep "\"event\":\"health_report_rejected\"" | grep -q "unknown path key"'; then
+if retry 60 'clog_since 120s | grep "\"event\":\"health_report_rejected\"" | grep -q "unknown path key"'; then
   ok "a Node-scope domain key nothing reads was rejected"
 else
   bad "node-scope path report was not rejected"
 fi
-stop_pf
 note "sharing itself is exercised by unit tests until Phase 6 wires probe-scope"
 note "from the NAD; the controller computes Endpoint scope today"
 if ( cd "$ROOT" && go test ./internal/controller/ \

@@ -9,7 +9,10 @@
 # Assumes a controller is already running (make deploy). Everything else it
 # asserts is cluster state, so it works the same against an out-of-cluster
 # controller except for the ownership test, which needs to stop the controller.
-set -uo pipefail
+# No pipefail: `grep -q` exits on first match and SIGPIPEs its upstream stage,
+# which under pipefail turns a successful assertion into a failed pipeline --
+# intermittently, depending on whether the upstream had finished writing.
+set -u
 
 NS=${NS:-ms-e2e}
 SVC=${SVC:-amf-n2}

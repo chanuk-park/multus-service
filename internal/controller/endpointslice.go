@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -328,11 +329,18 @@ func equalSlices[T comparable](a, b []T) bool {
 }
 
 // sliceOp describes what reconciliation did, for the event stream.
+//
+// Begin and End bracket the API write. The evaluation measures DNS convergence
+// from Begin, not End: CoreDNS watches the API server, so it can observe the
+// write before the controller's call returns, which otherwise produces a
+// negative interval that is an artefact rather than a result.
 type sliceOp struct {
 	Name       string
 	Op         string // create | update | delete | nochange
 	ReadyCount int
 	Total      int
+	BeginNanos int64
+	EndNanos   int64
 }
 
 // applySlices makes the cluster match want, deleting any owned slice that is no
@@ -378,12 +386,13 @@ func (r *ServiceReconciler) applySlices(
 		cur, ok := have[name]
 		switch {
 		case !ok:
+			begin := time.Now().UnixNano()
 			if err := r.Create(ctx, w); err != nil && !apierrors.IsAlreadyExists(err) {
 				return ops, fmt.Errorf("create slice %s: %w", name, err)
 			}
-			ops = append(ops, sliceOp{name, "create", ready, len(w.Endpoints)})
+			ops = append(ops, sliceOp{name, "create", ready, len(w.Endpoints), begin, time.Now().UnixNano()})
 		case sliceUpToDate(cur, w):
-			ops = append(ops, sliceOp{name, "nochange", ready, len(w.Endpoints)})
+			ops = append(ops, sliceOp{name, "nochange", ready, len(w.Endpoints), 0, 0})
 		default:
 			upd := cur.DeepCopy()
 			upd.AddressType = w.AddressType
@@ -402,10 +411,11 @@ func (r *ServiceReconciler) applySlices(
 				upd.Annotations[k] = v
 			}
 			upd.OwnerReferences = w.OwnerReferences
+			begin := time.Now().UnixNano()
 			if err := r.Update(ctx, upd); err != nil {
 				return ops, fmt.Errorf("update slice %s: %w", name, err)
 			}
-			ops = append(ops, sliceOp{name, "update", ready, len(w.Endpoints)})
+			ops = append(ops, sliceOp{name, "update", ready, len(w.Endpoints), begin, time.Now().UnixNano()})
 		}
 	}
 
@@ -417,10 +427,11 @@ func (r *ServiceReconciler) applySlices(
 	}
 	sort.Strings(stale)
 	for _, name := range stale {
+		begin := time.Now().UnixNano()
 		if err := r.Delete(ctx, have[name]); err != nil && !apierrors.IsNotFound(err) {
 			return ops, fmt.Errorf("delete slice %s: %w", name, err)
 		}
-		ops = append(ops, sliceOp{name, "delete", 0, 0})
+		ops = append(ops, sliceOp{name, "delete", 0, 0, begin, time.Now().UnixNano()})
 	}
 
 	return ops, nil

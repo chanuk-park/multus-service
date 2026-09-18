@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
 # Decomposes end-to-end convergence for a local (link-down) failure.
 #
-#   t0  fault injected in the Pod netns
-#   t1  agent detected it                 (failure_detected)
-#   t2  agent sent the report             (health_report_sent)
-#   t3  controller received it            (health_report_received)
-#   t4  controller applied it             (health_report_applied)
-#   t5  controller patched the slice      (slice_patched)
-#   t6  DNS stopped answering the address (polled from a client Pod)
+# Anchors, grouped by the clock that produced them:
 #
-# Every anchor except t0 and t6 comes from the JSONL event stream, so the
-# numbers are the system's own timestamps rather than an observer's.
+#   driver      t0   fault injected in the Pod netns
+#               t6   address gone from the DNS answer
+#   agent       a1   failure_detected
+#               a2   health_report_sent
+#   controller  c1   health_report_received
+#               c2   health_report_applied
+#               c3   slice_patch_begin
+#               c4   slice_patched (write returned)
+#
+# Intervals are reported within a single clock wherever possible. The three
+# cross-clock ones are labelled as such: on a single-node deployment they share
+# a clock, but the method must not depend on that.
+#
+# DNS convergence is measured from c3, the moment the write is issued, not from
+# c4. CoreDNS watches the API server, so it can observe the write before the
+# controller's call returns; measuring from c4 yields negative intervals that
+# are an artefact rather than a result.
 #
 # usage: measure-convergence.sh [iterations]
 set -uo pipefail
-N=${1:-5}
+N=${1:-20}
 NS=${NS:-ms-conv}
 SVC=amf-conv
 SLICE="$SVC-secondary-ipv4"
@@ -26,12 +35,12 @@ agent_pod() {
   kubectl -n "$CTRL_NS" get pod -l app=multus-service-agent \
     --field-selector spec.nodeName="$NODE" -o jsonpath='{.items[0].metadata.name}'
 }
+ALOG_PID=""; CLOG_PID=""; DNS_PID=""
 cleanup() {
   kill $ALOG_PID $CLOG_PID $DNS_PID 2>/dev/null
   kubectl delete ns "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
   "$FIXTURES/lab.sh" down >/dev/null 2>&1
 }
-ALOG_PID=""; CLOG_PID=""; DNS_PID=""
 trap cleanup EXIT
 
 if kubectl get ns "$NS" >/dev/null 2>&1; then
@@ -103,21 +112,22 @@ for _ in $(seq 1 90); do
         | grep -o '"attachment_id":"[^"]*"' | cut -d'"' -f4)
   [ -n "$AID" ] && break; sleep 1
 done
-IP=$(kubectl -n "$NS" get endpointslice "$SLICE" -o jsonpath='{.endpoints[0].addresses[0]}' 2>/dev/null)
 for _ in $(seq 1 120); do
   kubectl -n "$NS" get endpointslice "$SLICE" -o jsonpath='{.endpoints[0].conditions.ready}' 2>/dev/null | grep -q true && break
   sleep 1
 done
-# Read the TTL only once the name actually resolves, or dig returns nothing to
-# read it from.
+IP=$(kubectl -n "$NS" get endpointslice "$SLICE" -o jsonpath='{.endpoints[0].addresses[0]}' 2>/dev/null)
 TTL=""
 for _ in $(seq 1 60); do
   TTL=$(kubectl -n "$NS" exec dnsprobe -- dig +noall +answer "$SVC.$NS.svc.cluster.local" 2>/dev/null | awk '{print $2; exit}')
   [ -n "$TTL" ] && break; sleep 1
 done
-echo "attachment=$AID ip=$IP netns=$NSPATH coredns_ttl=${TTL:-unknown}s"
+echo "attachment=$AID ip=$IP coredns_ttl=${TTL:-unknown}s runs=$N"
+echo "netns=$NSPATH"
 
-# in-pod DNS poller: only prints transitions, with millisecond epochs
+# In-pod DNS poller. It records dig's exit status: an empty answer from a failed
+# lookup is not a withdrawal, and counting it as one is how a measurement ends up
+# claiming DNS converged before the fault was even detected.
 kubectl -n "$NS" exec -i dnsprobe -- sh -c 'cat > /tmp/w.py' <<'PY'
 import subprocess, sys, time
 fqdn, dur, iv = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
@@ -125,93 +135,39 @@ end, prev = time.time() + dur, None
 while time.time() < end:
     t = time.time()
     try:
-        out = subprocess.run(["dig","+short","+tries=1","+time=1",fqdn],
-                             capture_output=True, text=True, timeout=2).stdout
-        ans = ",".join(sorted(x for x in out.split() if x)) or "<empty>"
+        p = subprocess.run(["dig","+short","+tries=1","+time=1",fqdn],
+                           capture_output=True, text=True, timeout=2)
+        rc = p.returncode
+        ans = ",".join(sorted(x for x in p.stdout.split() if x)) or "<empty>"
     except Exception:
-        ans = "<timeout>"
-    if ans != prev:
-        print("%d %s" % (t*1000, ans), flush=True); prev = ans
+        rc, ans = 99, "<timeout>"
+    cur = (rc, ans)
+    if cur != prev:
+        print("%d %d %s" % (t*1000, rc, ans), flush=True); prev = cur
     d = iv - (time.time() - t)
     if d > 0: time.sleep(d)
 PY
 
-ALOG=$(mktemp); CLOG=$(mktemp); DLOG=$(mktemp)
+ALOG=$(mktemp); CLOG=$(mktemp); DLOG=$(mktemp); RESULTS=$(mktemp)
 kubectl -n "$CTRL_NS" logs -f "$(agent_pod)" --tail=0 > "$ALOG" 2>/dev/null & ALOG_PID=$!
 kubectl -n "$CTRL_NS" logs -f deploy/multus-service-controller --tail=0 > "$CLOG" 2>/dev/null & CLOG_PID=$!
-RUNTIME=$(( N * 22 + 30 ))
+RUNTIME=$(( N * 22 + 40 ))
 kubectl -n "$NS" exec dnsprobe -- python3 -u /tmp/w.py "$SVC.$NS.svc.cluster.local" "$RUNTIME" 0.05 > "$DLOG" 2>/dev/null & DNS_PID=$!
 sleep 3
 
 echo
 for i in $(seq 1 "$N"); do
-  : > /tmp/conv_mark
   T0=$(python3 -c 'import time;print(int(time.time()*1e9))')
   sudo -n nsenter --net="$NSPATH" ip link set net1 down
   sleep 9
-
-  python3 - "$T0" "$AID" "$IP" "$ALOG" "$CLOG" "$DLOG" "$i" <<'PY'
-import json, sys, re
-t0, aid, ip, alog, clog, dlog, run = sys.argv[1:8]
-t0 = int(t0)
-
-def events(path):
-    out = []
-    for line in open(path, errors="ignore"):
-        line = line.strip()
-        if not line.startswith("{"): continue
-        try: out.append(json.loads(line))
-        except Exception: pass
-    return out
-
-A, C = events(alog), events(clog)
-def first(evs, pred):
-    for e in evs:
-        if e.get("ts", 0) >= t0 and pred(e): return e["ts"]
-    return None
-
-t1 = first(A, lambda e: e.get("event")=="failure_detected" and e.get("attachment_id")==aid)
-t2 = first(A, lambda e: e.get("event")=="health_report_sent" and e.get("attachment_id")==aid
-                        and e.get("local_ready") is False)
-t3 = first(C, lambda e: e.get("event")=="health_report_received" and e.get("attachment_id")==aid
-                        and e.get("local_ready") is False)
-t4 = first(C, lambda e: e.get("event")=="health_report_applied" and e.get("attachment_id")==aid
-                        and e.get("local_ready") is False)
-t5 = first(C, lambda e: e.get("event")=="slice_patched" and e.get("ready")==0)
-
-t6 = None
-for line in open(dlog, errors="ignore"):
-    p = line.split()
-    if len(p) < 2 or not p[0].isdigit(): continue
-    ms, ans = int(p[0]), p[1]
-    # A transient resolver timeout is not a withdrawal. Only a real answer set
-    # that no longer carries the address counts.
-    if ans == "<timeout>": continue
-    if ms*1_000_000 >= t0 and ip not in ans:
-        t6 = ms*1_000_000; break
-
-def ms(a, b):
-    if a is None or b is None: return None
-    return (b - a)/1e6
-
-# Each stage is timed against the previous anchor that actually exists, so one
-# missing event blanks its own row instead of cascading through the rest.
-stages = [("t1 detect      ", t1), ("t2 send        ", t2), ("t3 receive     ", t3),
-          ("t4 apply       ", t4), ("t5 slice patch ", t5), ("t6 dns withdraw", t6)]
-rows, prev = [], t0
-for name, ts in stages:
-    rows.append((name, ms(prev, ts)))
-    if ts is not None: prev = ts
-print("run %s" % run)
-for name, v in rows:
-    print("   %s %s" % (name, ("%8.1f ms" % v) if v is not None else "      n/a"))
-print("   %s %s" % ("total t0->t6   ", ("%8.1f ms" % ms(t0,t6)) if ms(t0,t6) is not None else "      n/a"))
-# t5 -> t6 can come out slightly negative: the controller logs slice_patched
-# after its API write returns, while CoreDNS can already have observed that
-# same write. The ordering is real, the sign is an artefact of where each
-# timestamp is taken.
-PY
-
+  python3 "$(dirname "$0")/convergence_parse.py" --mode run \
+    --t0 "$T0" --attachment "$AID" --ip "$IP" \
+    --agent-log "$ALOG" --controller-log "$CLOG" --dns-log "$DLOG" \
+    --run "$i" >> "$RESULTS"
+  tail -1 "$RESULTS"
   sudo -n nsenter --net="$NSPATH" ip link set net1 up
   sleep 12
 done
+
+echo
+python3 "$(dirname "$0")/convergence_parse.py" --mode summary --results "$RESULTS"

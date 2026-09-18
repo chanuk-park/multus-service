@@ -7,7 +7,10 @@
 #
 # Runs on a node that has crictl and root, because it injects faults directly
 # into Pod network namespaces.
-set -uo pipefail
+# No pipefail: `grep -q` exits on first match and SIGPIPEs its upstream stage,
+# which under pipefail turns a successful assertion into a failed pipeline --
+# intermittently, depending on whether the upstream had finished writing.
+set -u
 
 NS=${NS:-ms-e2e2}
 SVC=${SVC:-amf-local}
@@ -89,8 +92,11 @@ trap cleanup EXIT
 
 head_ "setup"
 if [ -z "$(agent_pod)" ]; then
-  echo "  no agent pod on $NODE -- deploy the DaemonSet first"; exit 1
+  echo "  waiting for a node agent on $NODE"
+  retry 240 '[ -n "$(agent_pod)" ]' || { bad "no agent pod on $NODE -- deploy the DaemonSet first"; exit 1; }
 fi
+retry 240 '[ "$(kubectl -n "$CTRL_NS" get pod "$(agent_pod)" -o jsonpath="{.status.phase}" 2>/dev/null)" = "Running" ]' \
+  || { bad "agent on $NODE never became Running"; exit 1; }
 echo "  agent: $(agent_pod) on $NODE"
 
 # A namespace left terminating from a previous run would silently swallow every

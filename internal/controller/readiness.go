@@ -8,6 +8,8 @@ import (
 // event stream diagnosable after the fact, and it keeps the two halves of the
 // health state visible rather than collapsed into one boolean.
 type Readiness struct {
+	AttachmentID string
+
 	Ready  bool
 	Reason string
 
@@ -33,8 +35,9 @@ type Readiness struct {
 func ComputeReady(a model.Attachment, scope model.ProbeScope, hs *HealthStore) Readiness {
 	pathKey := a.PathKey(scope)
 	r := Readiness{
-		Local: hs.LocalState(a.ID()),
-		Path:  hs.PathState(pathKey),
+		AttachmentID: a.ID(),
+		Local:        hs.LocalState(a.ID()),
+		Path:         hs.PathState(pathKey),
 	}
 
 	if !a.PodReady {

@@ -30,9 +30,18 @@ spec:
             # is sent as a delta immediately instead of waiting for the next
             # full send.
             - --refresh=2s
-            # Phase 3 scaffold: no probe exists yet, so path state is asserted
-            # rather than measured. Phase 4 replaces this with a real probe.
-            - --path-probe=assume-ready
+            # Real ICMP probe, sourced from inside each Pod netns and bound to
+            # the secondary address and interface. A network opts in by setting
+            # secondary-service.boanlab.io/health-target on its NAD; without one
+            # no path state is produced and the endpoint stays not-ready.
+            - --path-probe=icmp
+            - --probe-interval=500ms
+            # Below the interval on purpose: a failing path fails by timing
+            # out, and a timeout longer than the interval stretches the
+            # effective sampling period.
+            - --probe-timeout=400ms
+            - --failure-threshold=3
+            - --success-threshold=2
             - --events-file=-
             - --zap-log-level=info
           env:

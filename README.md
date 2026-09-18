@@ -130,15 +130,17 @@ cluster-wide IPAM to avoid the situation entirely.
 | 1 | network-status parser; Service → EndpointSlice; Pod lifecycle; `ready=false` pre-registration | **done**, 23/23 acceptance on a live cluster |
 | 2 | Node agent: Pod UID → sandbox netns, netlink local health | **done**, 14/14 acceptance |
 | 3 | gRPC health transport, snapshots, stale-report rejection | **done**, 21/21 acceptance |
-| 4 | Endpoint-scope active path probe, hysteresis | next — replaces the `--path-probe=assume-ready` scaffold |
+| 4 | Endpoint-scope active path probe, hysteresis | **done**, 21/21 acceptance |
 | 5 | Final readiness, all-endpoints-down guard | `readiness.go` computes it; the guard is outstanding |
-| 6 | Node-scope shared path probe, `probe-scope` read from the NAD | last |
+| 6 | Node-scope shared path probe, `probe-scope` read from the NAD | last — the probe manager already keys on scope, so this is target construction, not new machinery |
 
-The agent supplies local state and, with `--path-probe=assume-ready`, a Phase 3
-scaffold that asserts path state instead of measuring it. With `--path-probe=none`
-no path report is ever fresh, so every endpoint stays `ready=false` — the correct
-behaviour rather than a placeholder: an address nobody has checked must not be
-advertised. Phase 4 replaces the scaffold with a real probe.
+`--path-probe=icmp` probes the real secondary datapath. `--path-probe=none`
+produces no path state, so every endpoint stays `ready=false` — the correct
+answer rather than a placeholder: an address nobody has checked must not be
+advertised. `assume-ready` asserts path state without measuring it. It is a debugging aid
+only — no acceptance test uses it — and `--evaluation-mode` refuses to start
+with it, so a measurement run cannot silently report numbers the system never
+took.
 
 ### Two kinds of state, two streams
 
@@ -178,6 +180,7 @@ internal/controller      reconcile, EndpointSlice diff/apply, registry, health
 internal/agent           the per-node observation loop and the gRPC sink
 internal/agent/netns     Pod UID → sandbox netns (Resolver interface + CRI impl)
 internal/agent/local     netns-scoped netlink inspection and subscription
+internal/agent/probe     ICMP prober, hysteresis state machine, probe manager
 internal/obs             JSONL measurement event stream
 api/health.proto         agent → controller protocol
 api/healthpb             generated Go bindings
@@ -186,6 +189,7 @@ test/fixtures            NADs, workload, Service, VXLAN/dummy lab helper
 test/e2e/phase1.sh       Phase 1 acceptance (24 checks)
 test/e2e/phase2.sh       Phase 2 acceptance (14 checks)
 test/e2e/phase3.sh       Phase 3 acceptance (21 checks)
+test/e2e/phase4.sh       Phase 4 acceptance (21 checks)
 test/tools/healthreport  sends deliberately bad reports, for the rejection tests
 hack/measure-detection.sh    detection latency alone
 hack/measure-convergence.sh  full t0 → t6 decomposition
@@ -198,7 +202,7 @@ make test                       # unit tests
 make run                        # controller out of cluster, events to stdout
 make load NODES=10.10.10.171    # build both images, import into every k3s node
 make deploy                     # controller Deployment + agent DaemonSet
-make e2e                        # phase 1, 2 and 3 acceptance
+make e2e                        # phase 1 through 4 acceptance
 ```
 
 `make load` imports straight into each node's containerd, so no registry is
@@ -230,43 +234,69 @@ two externally observed points:
 | DNS convergence | `slice_patched` | address gone from DNS (external `t4`) |
 | User-visible outage | `t0` | last failed request (external `t5`) |
 
+### Method
+
+Anchors are grouped by the clock that produced them, and each interval is
+reported within one clock wherever possible:
+
+```
+driver      t0  fault injected            t6  address gone from the DNS answer
+agent       a1  failure_detected          a2  health_report_sent
+controller  c1  health_report_received    c2  health_report_applied
+            c3  slice_patch_begin         c4  slice_patched (write returned)
+```
+
+Two things this fixes. DNS convergence is measured from **c3**, when the write
+is issued, not from c4: CoreDNS watches the API server and can observe the write
+before the controller's call returns, so measuring from c4 produces negative
+intervals that are an artefact rather than a result. And a run whose anchors are
+not monotonic is reported invalid rather than averaged in — an interval that
+runs backwards means the measurement is wrong, not that the system is fast.
+
 ### Measured decomposition
 
-Eight runs on the two-node k3s cluster, CoreDNS at its default 5 s TTL, local
+20 runs, all valid, two-node k3s cluster, CoreDNS at its default 5 s TTL, local
 failure injected as `ip link set net1 down` inside the Pod netns
-(`hack/measure-convergence.sh`):
+(`hack/measure-convergence.sh`). All values in ms:
 
-| Stage | | Measured |
-| --- | --- | --- |
-| `t0 → t1` | agent detects (netlink) | 124 – 203 ms, median **129 ms** |
-| `t1 → t2` | agent sends the report | 0.1 – 0.3 ms |
-| `t2 → t3` | controller receives it | 0.4 – 1.6 ms |
-| `t3 → t4` | controller applies it | 0.0 – 0.2 ms |
-| `t4 → t5` | EndpointSlice patched | 6.8 – 11.2 ms |
-| `t5 → t6` | address gone from DNS | −41 – 3764 ms |
-| `t0 → t6` | end to end | **99 – 3905 ms** |
+| Interval | Clock | min | median | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| detection `t0 → a1` | cross | 108.4 | **127.7** | 133.2 | 142.5 |
+| agent queue `a1 → a2` | agent | 0.1 | 0.2 | 0.2 | 0.5 |
+| transport `a2 → c1` | cross | 0.4 | 0.7 | 2.4 | 2.4 |
+| store apply `c1 → c2` | ctrl | 0.0 | 0.1 | 0.1 | 0.2 |
+| to patch `c2 → c3` | ctrl | 0.6 | 0.8 | 1.8 | 8.4 |
+| patch write `c3 → c4` | ctrl | 5.5 | 8.8 | 9.8 | 10.2 |
+| DNS converge `c3 → t6` | cross | 120.9 | **2694.3** | 4151.8 | 4243.3 |
+| user visible `t0 → t6` | driver | 245.1 | **2812.9** | 4284.4 | 4387.1 |
 
-Everything from fault to published slice takes **140–225 ms**. The rest is
-CoreDNS caching: `t5 → t6` is effectively uniform over `[0, TTL]`, so it averages
-about half the TTL — ~2.5 s at the 5 s default. It can come out slightly
-negative because the controller logs `slice_patched` after its API write
-returns, while CoreDNS can already have seen that same write.
+The system itself adds little: transport and store apply are sub-millisecond,
+the EndpointSlice write is ~9 ms, and everything from fault to issued write is
+about 130 ms. The rest is CoreDNS caching, effectively uniform over `[0, TTL]`,
+so it averages about half the TTL.
+
+A path failure adds `probe interval × failure threshold` in front of all of
+this. Measured at the defaults (500 ms, k=3): **1000 ms** from the first failed
+sample to withdrawal, over exactly 3 failed samples.
 
 ### Which term dominates depends on the failure class
 
 This is not a single headline number, and stating one would be wrong.
 
-**Local failures** — link down, address lost. netlink sees them in ~130 ms, so
-detection is now the *smallest* term and DNS caching dominates by an order of
-magnitude.
+**Local failures are event-driven.** A link going down or an address being lost
+emits netlink immediately: ~130 ms to detection, so detection is the *smallest*
+term and DNS caching dominates by an order of magnitude.
 
-**Path failures** — underlay, tunnel, or peer loss. netlink is blind to these:
-they break reachability while changing no local kernel state, so neither a host
-nor a Pod netlink monitor fires at all. Detection then costs probe interval ×
-failure threshold, and is likely to dominate again. Phase 4 is where that number
-gets measured.
+**Path failures are probe-driven.** netlink is blind to them — they break
+reachability while changing no local kernel state, so neither a host nor a Pod
+netlink monitor fires at all. Detection then costs `interval × k`, which at the
+defaults is 1000 ms: comparable to the DNS term rather than dwarfed by it, and
+tunable in a way the DNS term is not.
 
-`hack/measure-detection.sh` reproduces the first row alone.
+The two classes therefore have their convergence budgets dominated by different
+components, and a single headline number would misrepresent both.
+
+`hack/measure-detection.sh` reproduces the netlink detection row alone.
 
 ## Resolving a Pod to its network namespace
 
@@ -298,6 +328,61 @@ Both link and address events are needed. Taking a link down emits only
 address-only subscription misses the fault entirely; flushing the address emits
 only `RTM_DELADDR`. `test/e2e/phase2.sh` asserts exactly this: during link-down
 the agent reports `address_present=true` alongside `link_usable=false`.
+
+## The path probe
+
+What a path probe means is deliberately narrow:
+
+```
+P(e) = reachability from the endpoint's secondary source
+       to the health target declared on its NAD
+```
+
+It is **not** a claim that every client can reach the endpoint. A partial
+partition, or connectivity that differs per client, is outside what one probe can
+say. The value comes from where the sample is sourced, not from the target being
+special.
+
+**Sourced inside the Pod netns, bound explicitly.** Entering the namespace and
+letting its routing table pick the interface would usually work, and "usually"
+is not a correctness argument: a default route, a second attachment or a policy
+rule could send the probe out of a different interface and the result would still
+look like a healthy secondary path. The socket is opened inside the namespace,
+bound to the secondary address, and pinned to the interface with
+`SO_BINDTODEVICE`. Every sample records `source_ip`, `interface` and `target`.
+
+**ICMP, not TCP.** The model already separates three things — `PodReady` covers
+the application, `LocalReady` covers the attachment, `PathReady` covers network
+reachability. A TCP probe against a remote service port would fold remote
+application availability back into the path term and blur that separation.
+
+**The probe does not decide.** It produces samples; a separate state machine
+applies hysteresis; only then does a `PathHealth` exist:
+
+```
+Raw probe ── success / failure / RTT ──▶ state machine ── k fails, m successes ──▶ PathHealth
+```
+
+Keeping them apart is what lets Node scope share one state machine across a
+whole `(node, NAD)` domain instead of running one per attachment:
+
+```
+Endpoint scope                     Node scope
+  A → probe A → hysteresis A         (node, NAD) → probe → hysteresis ─┬─ A
+  B → probe B → hysteresis B                                          ├─ B
+  C → probe C → hysteresis C                                          └─ C
+```
+
+Every sample is logged as `path_probe`, every transition as
+`path_state_changed`. Both are needed: the gap between them is the hysteresis
+cost, and it can only be measured if the first failed sample is in the stream
+alongside the decision it eventually caused.
+
+**Timeout below interval.** A failing path fails by timing out, so a timeout
+longer than the probe interval stretches the effective sampling period — and the
+thresholds are expressed in samples, so the stretch shows up as unexplained
+delay. A round that overruns is skipped and recorded as `probe_round_skipped`
+rather than silently pushing the next one out.
 
 ## The health transport
 
@@ -379,3 +464,30 @@ does not match.
 | `health_snapshot_applied` | controller | A node's full state was replaced; `moved` counts what actually changed. |
 | `health_resync_requested` | agent | The controller asked for a full snapshot. |
 | `health_expired` | controller | An entry crossed the freshness window — the agent stopped talking, which is a different event from a reported failure. |
+
+## Threat model and scope
+
+The controller, the node agents and the channel between them are assumed to be a
+**trusted control plane**. The transport is plain gRPC with no peer
+authentication.
+
+That bounds what one of its checks buys. A report must come from the node its
+attachment actually runs on, which stops a misconfigured or confused agent from
+speaking for another node's endpoints. It does **not** stop a malicious client
+that simply puts the target node's name in the envelope. Making it do so would
+need mTLS or a node-bound credential, which is outside this work — and is a
+reasonable place for follow-on work to start.
+
+The registry check is a different matter and holds regardless: an attachment the
+controller never derived cannot be created by a report, whatever the reporter
+claims to be.
+
+## Probe events
+
+| Event | Meaning |
+| --- | --- |
+| `probe_loop_started` | Probe loop came up, with its interval and thresholds. |
+| `path_probe` | One sample: success, RTT, error kind, and the source it was bound to. |
+| `path_state_changed` | The debounced state moved, with the streak that caused it. |
+| `probe_round_skipped` | A round overran its interval, so the effective sampling period is longer than configured. |
+| `readiness_changed` | The controller's verdict for an attachment changed, naming which term of the conjunction blocked it. |

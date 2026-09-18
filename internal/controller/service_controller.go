@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -42,6 +43,13 @@ type ServiceReconciler struct {
 	// reconciler is the only writer: attachments come from Service + Pod +
 	// network-status, never from what an agent claims to see.
 	Registry *Registry
+
+	// reasons remembers why each attachment was last published as it was, so a
+	// change of reason is an event rather than something only visible by
+	// diffing two slices. Which term of the readiness conjunction failed is
+	// what distinguishes a local fault from a path fault in the evaluation.
+	reasonMu sync.Mutex
+	reasons  map[string]string
 
 	// HealthEvents re-enqueues a Service when its health input changed.
 	// Readiness would otherwise only move on the next Service or Pod event.
@@ -172,10 +180,19 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if op.Op == "nochange" {
 			continue
 		}
+		// Two anchors, not one: the write is observable by CoreDNS from the
+		// moment it lands, which can precede the call returning here.
+		r.Events.Emit("slice_patch_begin",
+			"namespace", svc.Namespace, "service", svc.Name,
+			"slice", op.Name, "op", op.Op,
+			"endpoints", op.Total, "ready", op.ReadyCount,
+			"at", op.BeginNanos)
 		r.Events.Emit("slice_patched",
 			"namespace", svc.Namespace, "service", svc.Name,
 			"slice", op.Name, "op", op.Op,
-			"endpoints", op.Total, "ready", op.ReadyCount)
+			"endpoints", op.Total, "ready", op.ReadyCount,
+			"begin", op.BeginNanos, "end", op.EndNanos,
+			"write_ms", float64(op.EndNanos-op.BeginNanos)/1e6)
 	}
 	if err != nil {
 		return ctrl.Result{}, err
@@ -187,10 +204,38 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			readyCount++
 		}
 	}
+	r.emitReasons(readiness)
 	lg.V(1).Info("reconciled", "service", svc.Name, "nad", nad,
 		"attachments", len(atts), "ready", readyCount)
 
 	return ctrl.Result{}, nil
+}
+
+// emitReasons records readiness reason transitions.
+func (r *ServiceReconciler) emitReasons(rs []Readiness) {
+	r.reasonMu.Lock()
+	if r.reasons == nil {
+		r.reasons = map[string]string{}
+	}
+	type change struct{ id, from, to string }
+	var changes []change
+	for _, rd := range rs {
+		if rd.AttachmentID == "" {
+			continue
+		}
+		prev, seen := r.reasons[rd.AttachmentID]
+		if seen && prev == rd.Reason {
+			continue
+		}
+		r.reasons[rd.AttachmentID] = rd.Reason
+		changes = append(changes, change{rd.AttachmentID, prev, rd.Reason})
+	}
+	r.reasonMu.Unlock()
+
+	for _, c := range changes {
+		r.Events.Emit("readiness_changed",
+			"attachment_id", c.id, "from", c.from, "to", c.to)
+	}
 }
 
 // validateService enforces the invariants; see attach.Validate for the reasons.
