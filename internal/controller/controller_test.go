@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"errors"
+
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +40,51 @@ func att(ip, iface, pod string, ready bool) model.Attachment {
 func build(t *testing.T, hs *HealthStore, atts ...model.Attachment) (map[string]*discoveryv1.EndpointSlice, []Readiness, []warning) {
 	t.Helper()
 	return desiredSlices(testService(), nadX, model.ScopeEndpoint, atts, hs)
+}
+
+// fakeClock drives the store's notion of "now". Freshness is measured from the
+// moment the controller accepted a report, so tests move the controller's clock
+// rather than backdating the agent's observed_at -- which is exactly the
+// distinction the design relies on.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+const (
+	testNode     = "node-1"
+	testInstance = "inst-1"
+)
+
+var testSeq uint64
+
+func newStore(ttl time.Duration) (*HealthStore, *fakeClock) {
+	c := &fakeClock{t: time.Now()}
+	hs := NewHealthStore(ttl)
+	hs.now = c.now
+	hs.AdoptInstance(testNode, testInstance)
+	return hs, c
+}
+
+func origin() model.ReportOrigin {
+	testSeq++
+	return model.ReportOrigin{NodeName: testNode, AgentInstance: testInstance, Sequence: testSeq}
+}
+
+func putLocal(t *testing.T, hs *HealthStore, r model.LocalHealth) {
+	t.Helper()
+	r.NodeName = testNode
+	if err := hs.AcceptLocal(origin(), r); err != nil {
+		t.Fatalf("AcceptLocal: %v", err)
+	}
+}
+
+func putPath(t *testing.T, hs *HealthStore, r model.PathHealth) {
+	t.Helper()
+	r.NodeName = testNode
+	if err := hs.AcceptPath(origin(), r); err != nil {
+		t.Fatalf("AcceptPath: %v", err)
+	}
 }
 
 func healthy(a model.Attachment, at time.Time) model.LocalHealth {
@@ -78,7 +125,7 @@ func TestNewEndpointsStartNotReady(t *testing.T) {
 	// An address nobody has health-checked is published ready=false, even when
 	// the Pod itself is Ready. Discovery and availability are decoupled on
 	// purpose: multus writes the address ~4.7s before the Pod is Ready.
-	hs := NewHealthStore(15 * time.Second)
+	hs, _ := newStore(15 * time.Second)
 	want, readiness, _ := build(t, hs, att("10.100.50.249", "n2", "amf-0", true))
 
 	s := want["amf-n2-secondary-ipv4"]
@@ -115,24 +162,22 @@ func TestReadyRequiresEveryTerm(t *testing.T) {
 	}{
 		{"pod not ready", false, &good, &goodPath, false, "PodNotReady"},
 		{"no local report", true, nil, &goodPath, false, "NoLocalReport"},
-		{"stale local report", true, stamp(good, now.Add(-time.Hour)), &goodPath, false, "LocalReportStale"},
 		{"interface gone", true, mut(good, func(l *model.LocalHealth) { l.InterfaceExists = false }), &goodPath, false, "InterfaceMissing"},
 		{"link down", true, mut(good, func(l *model.LocalHealth) { l.LinkUsable = false }), &goodPath, false, "LinkDown"},
 		{"address flushed", true, mut(good, func(l *model.LocalHealth) { l.AddressPresent = false }), &goodPath, false, "AddressMissing"},
 		{"no path report", true, &good, nil, false, "NoPathReport"},
-		{"stale path report", true, &good, stampPath(goodPath, now.Add(-time.Hour)), false, "PathReportStale"},
 		{"path down", true, &good, mutPath(goodPath, func(p *model.PathHealth) { p.PathReady = false }), false, "PathNotReady"},
 		{"all good", true, &good, &goodPath, true, "Healthy"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			hs := NewHealthStore(15 * time.Second)
+			hs, _ := newStore(15 * time.Second)
 			a.PodReady = c.podReady
 			if c.local != nil {
-				hs.PutLocal(*c.local)
+				putLocal(t, hs, *c.local)
 			}
 			if c.path != nil {
-				hs.PutPath(*c.path)
+				putPath(t, hs, *c.path)
 			}
 			got := ComputeReady(a, model.ScopeEndpoint, hs)
 			if got.Ready != c.wantReady || got.Reason != c.wantReason {
@@ -142,17 +187,43 @@ func TestReadyRequiresEveryTerm(t *testing.T) {
 	}
 }
 
+func TestStaleLocalReportBlocksReady(t *testing.T) {
+	hs, clk := newStore(5 * time.Second)
+	a := att("10.0.0.1", "net1", "amf-0", true)
+	putLocal(t, hs, healthy(a, time.Now()))
+	clk.advance(6 * time.Second)
+	putPath(t, hs, model.PathHealth{Scope: model.ScopeEndpoint, ScopeID: a.ID(), PathReady: true})
+
+	got := ComputeReady(a, model.ScopeEndpoint, hs)
+	if got.Ready || got.Reason != "LocalReportStale" {
+		t.Errorf("got (%v,%q), want (false,\"LocalReportStale\")", got.Ready, got.Reason)
+	}
+}
+
+func TestStalePathReportBlocksReady(t *testing.T) {
+	hs, clk := newStore(5 * time.Second)
+	a := att("10.0.0.1", "net1", "amf-0", true)
+	putPath(t, hs, model.PathHealth{Scope: model.ScopeEndpoint, ScopeID: a.ID(), PathReady: true})
+	clk.advance(6 * time.Second)
+	putLocal(t, hs, healthy(a, time.Now()))
+
+	got := ComputeReady(a, model.ScopeEndpoint, hs)
+	if got.Ready || got.Reason != "PathReportStale" {
+		t.Errorf("got (%v,%q), want (false,\"PathReportStale\")", got.Ready, got.Reason)
+	}
+}
+
 func TestLinkDownBeatsAddressPresent(t *testing.T) {
 	// Measured: taking a link down deletes the IPv6 link-local address but
 	// leaves the IPv4 address in place. An agent that only watched addresses
 	// would report this dead interface as healthy.
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	a := att("10.100.50.249", "n2", "amf-0", true)
-	hs.PutLocal(model.LocalHealth{
+	putLocal(t, hs, model.LocalHealth{
 		AttachmentID: a.ID(), InterfaceExists: true, AddressPresent: true,
 		LinkUsable: false, ObservedAt: time.Now(),
 	})
-	hs.PutPath(model.PathHealth{Scope: model.ScopeEndpoint, ScopeID: a.ID(), PathReady: true, ObservedAt: time.Now()})
+	putPath(t, hs, model.PathHealth{Scope: model.ScopeEndpoint, ScopeID: a.ID(), PathReady: true, ObservedAt: time.Now()})
 	if got := ComputeReady(a, model.ScopeEndpoint, hs); got.Ready || got.Reason != "LinkDown" {
 		t.Errorf("got (%v,%q), want (false,\"LinkDown\")", got.Ready, got.Reason)
 	}
@@ -163,11 +234,11 @@ func TestLinkDownBeatsAddressPresent(t *testing.T) {
 func TestStoreSeparatesStaleFromUnhealthy(t *testing.T) {
 	// A dead agent and a failing probe both drive ready=false, but they are
 	// different events and the store must tell them apart.
-	hs := NewHealthStore(10 * time.Second)
-	now := time.Now()
+	hs, clk := newStore(10 * time.Second)
 
-	hs.PutPath(model.PathHealth{ScopeID: "fresh-bad", PathReady: false, ObservedAt: now})
-	hs.PutPath(model.PathHealth{ScopeID: "stale-good", PathReady: true, ObservedAt: now.Add(-time.Minute)})
+	putPath(t, hs, model.PathHealth{ScopeID: "stale-good", PathReady: true})
+	clk.advance(11 * time.Second)
+	putPath(t, hs, model.PathHealth{ScopeID: "fresh-bad", PathReady: false})
 
 	if got := hs.PathState("fresh-bad"); got != model.StateUnhealthy {
 		t.Errorf("fresh failing probe = %v, want Unhealthy", got)
@@ -180,19 +251,114 @@ func TestStoreSeparatesStaleFromUnhealthy(t *testing.T) {
 	}
 }
 
+func TestFreshnessIgnoresTheAgentClock(t *testing.T) {
+	// A node with a badly skewed clock must not be able to make a current
+	// report look stale, nor a stale one look current. observed_at is carried
+	// for measurement and never consulted for freshness.
+	hs, _ := newStore(10 * time.Second)
+	putLocal(t, hs, model.LocalHealth{
+		AttachmentID: "skewed", InterfaceExists: true, AddressPresent: true, LinkUsable: true,
+		ObservedAt: time.Now().Add(-72 * time.Hour),
+	})
+	if _, fresh := hs.Local("skewed"); !fresh {
+		t.Error("a report the controller just accepted must be fresh regardless of observed_at")
+	}
+}
+
 func TestStoreIgnoresOutOfOrderReports(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
-	now := time.Now()
-	hs.PutPath(model.PathHealth{ScopeID: "a", PathReady: false, ObservedAt: now})
-	hs.PutPath(model.PathHealth{ScopeID: "a", PathReady: true, ObservedAt: now.Add(-time.Second)})
+	// One gRPC stream orders its own messages, but a reconnect can leave two
+	// streams briefly overlapping, so the sequence number decides.
+	hs, _ := newStore(time.Minute)
+	o := model.ReportOrigin{NodeName: testNode, AgentInstance: testInstance, Sequence: 10}
+	if err := hs.AcceptPath(o, model.PathHealth{ScopeID: "a", PathReady: false, NodeName: testNode}); err != nil {
+		t.Fatalf("AcceptPath: %v", err)
+	}
+	older := model.ReportOrigin{NodeName: testNode, AgentInstance: testInstance, Sequence: 9}
+	if err := hs.AcceptPath(older, model.PathHealth{ScopeID: "a", PathReady: true, NodeName: testNode}); !errors.Is(err, ErrOutOfOrder) {
+		t.Fatalf("err = %v, want ErrOutOfOrder", err)
+	}
 	if r, _ := hs.Path("a"); r.PathReady {
 		t.Error("an older report overwrote a newer one")
 	}
+}
 
-	hs.PutLocal(model.LocalHealth{AttachmentID: "b", LinkUsable: false, ObservedAt: now})
-	hs.PutLocal(model.LocalHealth{AttachmentID: "b", LinkUsable: true, ObservedAt: now.Add(-time.Second)})
-	if r, _ := hs.Local("b"); r.LinkUsable {
-		t.Error("an older local report overwrote a newer one")
+func TestRestartedAgentSupersedesTheOldInstance(t *testing.T) {
+	// The newest stream to open is authoritative for its node. Anything still
+	// in flight from the previous process is discarded rather than applied.
+	hs, _ := newStore(time.Minute)
+	old := model.ReportOrigin{NodeName: testNode, AgentInstance: testInstance, Sequence: 5}
+	if err := hs.AcceptLocal(old, model.LocalHealth{AttachmentID: "x", NodeName: testNode,
+		InterfaceExists: true, AddressPresent: true, LinkUsable: true}); err != nil {
+		t.Fatalf("AcceptLocal: %v", err)
+	}
+
+	if prev := hs.AdoptInstance(testNode, "inst-2"); prev != testInstance {
+		t.Errorf("superseded = %q, want %q", prev, testInstance)
+	}
+	if err := hs.AcceptLocal(old, model.LocalHealth{AttachmentID: "x", NodeName: testNode}); !errors.Is(err, ErrStaleInstance) {
+		t.Fatalf("err = %v, want ErrStaleInstance", err)
+	}
+	// The new instance starts its own sequence, so a low number must still land.
+	fresh := model.ReportOrigin{NodeName: testNode, AgentInstance: "inst-2", Sequence: 1}
+	if err := hs.AcceptLocal(fresh, model.LocalHealth{AttachmentID: "x", NodeName: testNode}); err != nil {
+		t.Fatalf("a new instance must not be blocked by the old sequence: %v", err)
+	}
+}
+
+func TestSnapshotReplacesNodeStateAtomically(t *testing.T) {
+	// A partial apply would be visible: the controller would publish whatever
+	// had not arrived yet as not ready. The commit happens in one step.
+	hs, _ := newStore(time.Minute)
+	putLocal(t, hs, model.LocalHealth{AttachmentID: "gone", InterfaceExists: true, AddressPresent: true, LinkUsable: true})
+	putLocal(t, hs, model.LocalHealth{AttachmentID: "kept", InterfaceExists: true, AddressPresent: true, LinkUsable: true})
+
+	o := model.ReportOrigin{NodeName: testNode, AgentInstance: testInstance, Sequence: 100}
+	err := hs.ApplySnapshot(o, []model.LocalHealth{{
+		AttachmentID: "kept", NodeName: testNode,
+		InterfaceExists: true, AddressPresent: true, LinkUsable: true,
+	}}, nil)
+	if err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+	if _, ok := hs.Local("gone"); ok {
+		t.Error("an attachment missing from the snapshot must be dropped")
+	}
+	if _, fresh := hs.Local("kept"); !fresh {
+		t.Error("an attachment present in the snapshot must survive")
+	}
+}
+
+func TestSnapshotOnlyTouchesItsOwnNode(t *testing.T) {
+	hs, _ := newStore(time.Minute)
+	hs.AdoptInstance("node-2", "inst-2")
+	if err := hs.AcceptLocal(
+		model.ReportOrigin{NodeName: "node-2", AgentInstance: "inst-2", Sequence: 1},
+		model.LocalHealth{AttachmentID: "other-node", NodeName: "node-2",
+			InterfaceExists: true, AddressPresent: true, LinkUsable: true}); err != nil {
+		t.Fatalf("AcceptLocal: %v", err)
+	}
+	o := model.ReportOrigin{NodeName: testNode, AgentInstance: testInstance, Sequence: 100}
+	if err := hs.ApplySnapshot(o, nil, nil); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+	if _, ok := hs.Local("other-node"); !ok {
+		t.Error("one node's snapshot must not clear another node's state")
+	}
+}
+
+func TestExpiryFiresOncePerEntry(t *testing.T) {
+	hs, clk := newStore(5 * time.Second)
+	putLocal(t, hs, model.LocalHealth{AttachmentID: "a", InterfaceExists: true, AddressPresent: true, LinkUsable: true})
+	if got := hs.SweepExpired(); len(got) != 0 {
+		t.Fatalf("nothing should be expired yet, got %v", got)
+	}
+	clk.advance(6 * time.Second)
+	got := hs.SweepExpired()
+	if len(got) != 1 || got[0].ID != "a" || got[0].Kind != "local" {
+		t.Fatalf("expired = %v, want one local entry \"a\"", got)
+	}
+	if again := hs.SweepExpired(); len(again) != 0 {
+		t.Error("an entry must only be reported expired once")
 	}
 }
 
@@ -200,7 +366,7 @@ func TestNodeScopeSharesOnePathResult(t *testing.T) {
 	// The reason the two streams are split: under Node scope a single probe
 	// result covers every attachment in the (node, NAD) domain. It is stored
 	// once and read by each attachment, never copied per Pod.
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	now := time.Now()
 
 	pods := []model.Attachment{
@@ -209,11 +375,11 @@ func TestNodeScopeSharesOnePathResult(t *testing.T) {
 		att("10.0.0.3", "net1", "c", true),
 	}
 	for _, p := range pods {
-		hs.PutLocal(healthy(p, now))
+		putLocal(t, hs, healthy(p, now))
 	}
 
 	domain := model.PathDomainID("node-1", nadX)
-	hs.PutPath(model.PathHealth{
+	putPath(t, hs, model.PathHealth{
 		Scope: model.ScopeNode, ScopeID: domain, NodeName: "node-1", NAD: nadX,
 		PathReady: true, ObservedAt: now,
 	})
@@ -228,7 +394,7 @@ func TestNodeScopeSharesOnePathResult(t *testing.T) {
 	}
 
 	// One shared transition moves every attachment at once -- no per-Pod skew.
-	hs.PutPath(model.PathHealth{
+	putPath(t, hs, model.PathHealth{
 		Scope: model.ScopeNode, ScopeID: domain, NodeName: "node-1", NAD: nadX,
 		PathReady: false, ObservedAt: now.Add(time.Second),
 	})
@@ -257,11 +423,11 @@ func TestPathKeyDependsOnScope(t *testing.T) {
 }
 
 func TestForgettingOneAttachmentKeepsSharedPath(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	now := time.Now()
 	a := att("10.0.0.1", "net1", "a", true)
-	hs.PutLocal(healthy(a, now))
-	hs.PutPath(model.PathHealth{
+	putLocal(t, hs, healthy(a, now))
+	putPath(t, hs, model.PathHealth{
 		Scope: model.ScopeNode, ScopeID: model.PathDomainID("node-1", nadX),
 		PathReady: true, ObservedAt: now,
 	})
@@ -274,7 +440,7 @@ func TestForgettingOneAttachmentKeepsSharedPath(t *testing.T) {
 // ---------------------------------------------------------------- slices
 
 func TestDualStackSplitsIntoTwoSlices(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	want, _, _ := build(t, hs,
 		att("10.100.61.10", "net1", "amf-0", true),
 		att("fd00:61::10", "net1", "amf-0", true),
@@ -345,7 +511,7 @@ func TestHostnameRejectsInvalidLabels(t *testing.T) {
 }
 
 func TestSliceUpToDateIgnoresOrder(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	x, _, _ := build(t, hs, att("10.0.0.2", "net1", "b", true), att("10.0.0.1", "net1", "a", true))
 	y, _, _ := build(t, hs, att("10.0.0.1", "net1", "a", true), att("10.0.0.2", "net1", "b", true))
 	if !sliceUpToDate(x["amf-n2-secondary-ipv4"], y["amf-n2-secondary-ipv4"]) {
@@ -354,7 +520,7 @@ func TestSliceUpToDateIgnoresOrder(t *testing.T) {
 }
 
 func TestOwnerReferencePointsAtService(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	want, _, _ := build(t, hs, att("10.0.0.1", "net1", "a", true))
 	or := want["amf-n2-secondary-ipv4"].OwnerReferences
 	if len(or) != 1 || or[0].Kind != "Service" || or[0].UID != "svc-uid" || !ptr.Deref(or[0].Controller, false) {
@@ -363,7 +529,7 @@ func TestOwnerReferencePointsAtService(t *testing.T) {
 }
 
 func TestManagedByLabelIsOurs(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	want, _, _ := build(t, hs, att("10.0.0.1", "net1", "a", true))
 	if got := want["amf-n2-secondary-ipv4"].Labels[discoveryv1.LabelManagedBy]; got != ManagedBy {
 		t.Errorf("managed-by = %q, want %q", got, ManagedBy)
@@ -371,7 +537,7 @@ func TestManagedByLabelIsOurs(t *testing.T) {
 }
 
 func TestSliceLimitTruncatesAndWarns(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	atts := make([]model.Attachment, 0, maxEndpointsPerSlice+5)
 	for i := 0; i < maxEndpointsPerSlice+5; i++ {
 		atts = append(atts, att(ipv4(i), "net1", "p"+itoa(i), true))
@@ -392,7 +558,7 @@ func TestConflictingAddressExcludesEveryClaimant(t *testing.T) {
 	// address alone, so a client cannot be steered to the Pod the controller
 	// chose, and both Pods still own the address in the data plane. Publishing
 	// neither is the only honest answer.
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	want, _, warn := build(t, hs,
 		att("10.244.77.2", "net1", "amf-b", true),
 		att("10.244.77.2", "net1", "amf-a", true),
@@ -408,7 +574,7 @@ func TestConflictingAddressExcludesEveryClaimant(t *testing.T) {
 }
 
 func TestConflictWarningNamesEveryClaimant(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	_, _, warn := build(t, hs,
 		att("10.244.77.2", "net1", "amf-a", true),
 		att("10.244.77.2", "net1", "amf-b", true),
@@ -428,7 +594,7 @@ func TestConflictWarningNamesEveryClaimant(t *testing.T) {
 }
 
 func TestConflictOnOneFamilyLeavesTheOtherAlone(t *testing.T) {
-	hs := NewHealthStore(time.Minute)
+	hs, _ := newStore(time.Minute)
 	want, _, _ := build(t, hs,
 		att("10.244.77.2", "net1", "amf-a", true),
 		att("10.244.77.2", "net1", "amf-b", true),
@@ -444,19 +610,9 @@ func TestConflictOnOneFamilyLeavesTheOtherAlone(t *testing.T) {
 
 // ---------------------------------------------------------------- helpers
 
-func stamp(l model.LocalHealth, at time.Time) *model.LocalHealth {
-	l.ObservedAt = at
-	return &l
-}
-
 func mut(l model.LocalHealth, f func(*model.LocalHealth)) *model.LocalHealth {
 	f(&l)
 	return &l
-}
-
-func stampPath(p model.PathHealth, at time.Time) *model.PathHealth {
-	p.ObservedAt = at
-	return &p
 }
 
 func mutPath(p model.PathHealth, f func(*model.PathHealth)) *model.PathHealth {

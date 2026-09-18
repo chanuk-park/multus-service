@@ -76,6 +76,9 @@ spec:
 | `ready` | Always written explicitly. Never nil. |
 | Local state | Observed only from inside the Pod netns. |
 | Node scope | Shares the *path* probe across a `(node, NAD)`. It does **not** remove the netns entry — local observation stays per-Pod. |
+| Probe config | `probe-scope`, `health-target`, `source-interface` live on the **NAD**, never on a Service. |
+| Report authority | A health report can only change an attachment the controller already derived. It can never create one. |
+| Freshness | Judged from when the controller accepted a report, never from the agent's clock. |
 | Duplicate address | Two Pods claiming one address: **neither** is published, and the collision is reported. |
 | Kernel bypass | DPDK / vfio-pci out of scope. |
 
@@ -126,14 +129,16 @@ cluster-wide IPAM to avoid the situation entirely.
 | --- | --- | --- |
 | 1 | network-status parser; Service → EndpointSlice; Pod lifecycle; `ready=false` pre-registration | **done**, 23/23 acceptance on a live cluster |
 | 2 | Node agent: Pod UID → sandbox netns, netlink local health | **done**, 14/14 acceptance |
-| 3 | gRPC health transport, stale-report rejection | protocol fixed in `api/health.proto`; store and freshness already in place |
-| 4 | Endpoint-scope active path probe, hysteresis | |
+| 3 | gRPC health transport, snapshots, stale-report rejection | **done**, 21/21 acceptance |
+| 4 | Endpoint-scope active path probe, hysteresis | next — replaces the `--path-probe=assume-ready` scaffold |
 | 5 | Final readiness, all-endpoints-down guard | `readiness.go` computes it; the guard is outstanding |
-| 6 | Node-scope shared path probe | last |
+| 6 | Node-scope shared path probe, `probe-scope` read from the NAD | last |
 
-The agent now supplies local state; until a path probe exists no path report is
-ever fresh, so every endpoint stays `ready=false`. That is the correct behaviour
-rather than a placeholder: an address nobody has checked must not be advertised.
+The agent supplies local state and, with `--path-probe=assume-ready`, a Phase 3
+scaffold that asserts path state instead of measuring it. With `--path-probe=none`
+no path report is ever fresh, so every endpoint stays `ready=false` — the correct
+behaviour rather than a placeholder: an address nobody has checked must not be
+advertised. Phase 4 replaces the scaffold with a real probe.
 
 ### Two kinds of state, two streams
 
@@ -168,17 +173,22 @@ cmd/agent                node agent entrypoint
 internal/multus          network-status parsing and NAD canonicalisation
 internal/attach          the annotation contract, shared by controller and agent
 internal/model           Attachment identity, LocalHealth, PathHealth, path domains
-internal/controller      reconcile, EndpointSlice diff/apply, health store, readiness
-internal/agent           the per-node observation loop
+internal/controller      reconcile, EndpointSlice diff/apply, registry, health
+                         store, readiness, gRPC server, expiry sweeper
+internal/agent           the per-node observation loop and the gRPC sink
 internal/agent/netns     Pod UID → sandbox netns (Resolver interface + CRI impl)
 internal/agent/local     netns-scoped netlink inspection and subscription
 internal/obs             JSONL measurement event stream
 api/health.proto         agent → controller protocol
+api/healthpb             generated Go bindings
 deploy/                  RBAC, Deployment, agent DaemonSet
 test/fixtures            NADs, workload, Service, VXLAN/dummy lab helper
 test/e2e/phase1.sh       Phase 1 acceptance (24 checks)
 test/e2e/phase2.sh       Phase 2 acceptance (14 checks)
-hack/measure-detection.sh  detection-latency measurement
+test/e2e/phase3.sh       Phase 3 acceptance (21 checks)
+test/tools/healthreport  sends deliberately bad reports, for the rejection tests
+hack/measure-detection.sh    detection latency alone
+hack/measure-convergence.sh  full t0 → t6 decomposition
 ```
 
 ## Running
@@ -188,12 +198,14 @@ make test                       # unit tests
 make run                        # controller out of cluster, events to stdout
 make load NODES=10.10.10.171    # build both images, import into every k3s node
 make deploy                     # controller Deployment + agent DaemonSet
-make e2e                        # phase 1 and phase 2 acceptance
+make e2e                        # phase 1, 2 and 3 acceptance
 ```
 
 `make load` imports straight into each node's containerd, so no registry is
-needed. `test/e2e/phase2.sh` injects faults into Pod network namespaces, so it
-must run on a node with root and `crictl`.
+needed. `test/e2e/phase2.sh` and `phase3.sh` inject faults into Pod network
+namespaces, so they must run on a node with root and `crictl`. `phase1.sh` parks
+the node agents while it runs, because it checks the controller's behaviour with
+no health reports at all, and restores them on exit.
 
 ## Measurement
 
@@ -218,18 +230,43 @@ two externally observed points:
 | DNS convergence | `slice_patched` | address gone from DNS (external `t4`) |
 | User-visible outage | `t0` | last failed request (external `t5`) |
 
-Bench numbers so far, on the two-node k3s cluster:
+### Measured decomposition
 
-| Interval | Measured |
-| --- | --- |
-| Detection (link down → `failure_detected`) | 121–158 ms, median **129 ms** over 6 runs |
-| Control plane (slice patch → API watch event) | ≈ **0.23 s** |
-| DNS convergence (slice change → answer change) | ≈ **0.97 s** at a 1 s TTL, 5 s is the default |
+Eight runs on the two-node k3s cluster, CoreDNS at its default 5 s TTL, local
+failure injected as `ip link set net1 down` inside the Pod netns
+(`hack/measure-convergence.sh`):
 
-Detection is the term the design controls, and at netlink speed it is now the
-smallest of the three. What netlink cannot see at all — an underlay blackhole,
-which changes no local kernel state — is what Phase 4 adds the active probe for.
-Reproduce the first row with `hack/measure-detection.sh`.
+| Stage | | Measured |
+| --- | --- | --- |
+| `t0 → t1` | agent detects (netlink) | 124 – 203 ms, median **129 ms** |
+| `t1 → t2` | agent sends the report | 0.1 – 0.3 ms |
+| `t2 → t3` | controller receives it | 0.4 – 1.6 ms |
+| `t3 → t4` | controller applies it | 0.0 – 0.2 ms |
+| `t4 → t5` | EndpointSlice patched | 6.8 – 11.2 ms |
+| `t5 → t6` | address gone from DNS | −41 – 3764 ms |
+| `t0 → t6` | end to end | **99 – 3905 ms** |
+
+Everything from fault to published slice takes **140–225 ms**. The rest is
+CoreDNS caching: `t5 → t6` is effectively uniform over `[0, TTL]`, so it averages
+about half the TTL — ~2.5 s at the 5 s default. It can come out slightly
+negative because the controller logs `slice_patched` after its API write
+returns, while CoreDNS can already have seen that same write.
+
+### Which term dominates depends on the failure class
+
+This is not a single headline number, and stating one would be wrong.
+
+**Local failures** — link down, address lost. netlink sees them in ~130 ms, so
+detection is now the *smallest* term and DNS caching dominates by an order of
+magnitude.
+
+**Path failures** — underlay, tunnel, or peer loss. netlink is blind to these:
+they break reachability while changing no local kernel state, so neither a host
+nor a Pod netlink monitor fires at all. Detection then costs probe interval ×
+failure threshold, and is likely to dominate again. Phase 4 is where that number
+gets measured.
+
+`hack/measure-detection.sh` reproduces the first row alone.
 
 ## Resolving a Pod to its network namespace
 
@@ -261,6 +298,40 @@ Both link and address events are needed. Taking a link down emits only
 address-only subscription misses the fault entirely; flushing the address emits
 only `RTM_DELADDR`. `test/e2e/phase2.sh` asserts exactly this: during link-down
 the agent reports `address_present=true` alongside `link_usable=false`.
+
+## The health transport
+
+Four rules shape it, and each exists because of a way the obvious design breaks.
+
+**Reports are not discovery.** The controller derives the attachment set from
+Service + Pod + network-status and computes `attachment_id` itself. An agent
+report is matched against that registry; an unknown id is rejected, never used
+to create an endpoint. A report must also describe the attachment the controller
+knows under that id — same NAD, interface and address — and must come from the
+node the attachment actually runs on, so no node can speak for another's
+endpoints.
+
+**No clocks are compared.** Ordering uses `agent_instance_id` + `sequence`:
+a fresh instance id per agent process, monotonic sequence within it. The newest
+stream to open is authoritative for its node, so anything still in flight from a
+restarted agent is discarded. Freshness is measured from `accepted_at`, the
+controller's own clock at the moment it took the report. `observed_at` travels
+on every report and is used for measurement only — a skewed node clock cannot
+make a stale report look current, nor a current one look stale.
+
+**Health is a renewable lease, not an event log.** An agent that only spoke on
+change would go silent after a controller restart: the network is still healthy,
+so nothing changes, and every endpoint would sit at Unknown for ever. Agents
+therefore resend the full state on connect and refresh it periodically
+(`--refresh`, which must stay well under the controller's `--health-ttl`).
+Changes still go out immediately as deltas, so a real failure does not wait for
+the next refresh.
+
+**Snapshots commit atomically.** A controller that restarted mid-send would
+otherwise reconcile against a partial set and publish the remainder as not
+ready. `SnapshotBegin` … `SnapshotEnd` brackets a node's full state and the
+controller replaces that node's entries in one step. Only that node's entries —
+one agent's snapshot never clears another's.
 
 ## Attachment identity
 
@@ -294,3 +365,17 @@ does not match.
 | `local_health` | One observation per attachment per resync, with all three checks reported individually. Also the report heartbeat that keeps the controller's freshness check satisfied. |
 | `failure_detected` / `recovery_detected` | Local readiness changed. These are the anchors detection latency is measured from. |
 | `attachment_retired` | The attachment is gone; a late report carrying its id can no longer be matched. |
+
+## Health transport events
+
+| Event | Side | Meaning |
+| --- | --- | --- |
+| `agent_connected` | controller | A stream opened; names the instance it superseded. |
+| `health_stream_opened` / `health_stream_closed` | agent | Transport lifecycle, with the error that ended it. |
+| `health_report_sent` | agent | One report left the node. `via` is `delta` or `snapshot`. |
+| `health_report_received` | controller | One report arrived. |
+| `health_report_applied` | controller | The store moved. `via` distinguishes the two paths. |
+| `health_report_rejected` | controller | With the reason: unknown attachment, unknown path key, superseded instance, sequence did not advance. |
+| `health_snapshot_applied` | controller | A node's full state was replaced; `moved` counts what actually changed. |
+| `health_resync_requested` | agent | The controller asked for a full snapshot. |
+| `health_expired` | controller | An entry crossed the freshness window — the agent stopped talking, which is a different event from a reported failure. |

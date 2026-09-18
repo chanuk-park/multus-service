@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Phase 1 acceptance: Service annotation -> secondary IP EndpointSlice, ready=false.
 #
-# Assumes a controller is already running (make deploy). Everything it asserts
-# is cluster state, so it works the same against an out-of-cluster controller
-# except for the ownership test, which needs to stop the controller.
+# This is a controller-level test. It parks the node agents for the duration so
+# that "an address nobody has health-checked is not advertised" can be asserted
+# exactly, rather than racing whatever the agents happen to be reporting. The
+# agents are restored on exit.
+#
+# Assumes a controller is already running (make deploy). Everything else it
+# asserts is cluster state, so it works the same against an out-of-cluster
+# controller except for the ownership test, which needs to stop the controller.
 set -uo pipefail
 
 NS=${NS:-ms-e2e}
@@ -11,12 +16,14 @@ SVC=${SVC:-amf-n2}
 SLICE="${SVC}-secondary-ipv4"
 CTRL_NS=${CTRL_NS:-multus-service-system}
 CTRL_DEPLOY=${CTRL_DEPLOY:-multus-service-controller}
+AGENT_DS=${AGENT_DS:-multus-service-agent}
 SEC_PREFIX=${SEC_PREFIX:-10.244.77.}
 FIXTURES="$(cd "$(dirname "$0")/../fixtures" && pwd)"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; [ $# -gt 1 ] && printf '        %s\n' "$2"; }
+note() { printf '  \033[33mNOTE\033[0m %s\n' "$1"; }
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # retry <seconds> <shell-snippet> -- succeeds as soon as the snippet does
@@ -42,10 +49,29 @@ cleanup() {
   head_ "cleanup"
   kubectl delete ns "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
   kubectl -n "$CTRL_NS" scale deploy "$CTRL_DEPLOY" --replicas=1 >/dev/null 2>&1
+  kubectl -n "$CTRL_NS" patch ds "$AGENT_DS" --type=json \
+    -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]' >/dev/null 2>&1
+  echo "  node agents restored"
 }
 trap cleanup EXIT
 
 head_ "setup"
+# Park the agents: with no health reports, every endpoint stays ready=false,
+# which is the property this phase exists to check.
+if kubectl -n "$CTRL_NS" get ds "$AGENT_DS" >/dev/null 2>&1; then
+  kubectl -n "$CTRL_NS" patch ds "$AGENT_DS" --type=merge \
+    -p '{"spec":{"template":{"spec":{"nodeSelector":{"multus-service.io/absent":"true"}}}}}' >/dev/null
+  retry 180 '[ "$(kubectl -n "$CTRL_NS" get pod -l app="$AGENT_DS" --no-headers 2>/dev/null | grep -c .)" = "0" ]' \
+    && echo "  node agents parked" || { bad "agents would not stand down"; exit 1; }
+fi
+
+# A namespace left terminating from a previous run would silently swallow every
+# object created into it.
+if kubectl get ns "$NS" >/dev/null 2>&1; then
+  kubectl delete ns "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
+  echo "  waiting for the previous $NS namespace to finish deleting"
+  retry 240 '! kubectl get ns "$NS" >/dev/null 2>&1' || { bad "namespace $NS stuck terminating"; exit 1; }
+fi
 kubectl apply -f "$FIXTURES/namespace.yaml" >/dev/null
 kubectl apply -f "$FIXTURES/nad-bridge.yaml" -f "$FIXTURES/service.yaml" \
               -f "$FIXTURES/workload.yaml" -f "$FIXTURES/probe-pod.yaml" >/dev/null
@@ -300,6 +326,47 @@ else
   echo "  (note: built-in slice not observed yet; timing)"
 fi
 kubectl -n "$NS" delete svc amf-n2-bad --wait=false >/dev/null 2>&1
+
+# ---------------------------------------------------------------- T10c
+head_ "T10c SCTP port/protocol 이 손실 없이 유지 (N2 가 SCTP 이므로)"
+cat <<EOP | kubectl apply -f - >/dev/null
+apiVersion: v1
+kind: Service
+metadata:
+  name: amf-n2-sctp
+  namespace: $NS
+  annotations:
+    secondary-service.boanlab.io/network: sec-net
+    secondary-service.boanlab.io/workload-selector: app=oai-amf
+spec:
+  clusterIP: None
+  ports: [{name: n2, port: 38412, protocol: SCTP}]
+EOP
+if retry 90 'k get endpointslice amf-n2-sctp-secondary-ipv4 >/dev/null 2>&1'; then
+  proto=$(k get endpointslice amf-n2-sctp-secondary-ipv4 -o jsonpath='{.ports[0].protocol}')
+  port=$(k get endpointslice amf-n2-sctp-secondary-ipv4 -o jsonpath='{.ports[0].port}')
+  name=$(k get endpointslice amf-n2-sctp-secondary-ipv4 -o jsonpath='{.ports[0].name}')
+  if [ "$proto" = "SCTP" ] && [ "$port" = "38412" ] && [ "$name" = "n2" ]; then
+    ok "slice carries n2/38412/SCTP unchanged"
+  else
+    bad "port reconciliation lost the protocol" "name=$name port=$port proto=$proto"
+  fi
+  addrs=$(k get endpointslice amf-n2-sctp-secondary-ipv4 -o jsonpath='{range .endpoints[*]}{.addresses[0]}{" "}{end}')
+  if [ -n "$addrs" ] && ! grep -q '10\.42\.' <<<"$addrs"; then
+    ok "secondary discovery unaffected by the protocol ($addrs)"
+  else
+    bad "secondary addresses wrong for the SCTP service" "$addrs"
+  fi
+  # CoreDNS derives the SRV owner name from the port's protocol.
+  if retry 30 'k exec dnsprobe -- nslookup -type=srv _n2._sctp.amf-n2-sctp.'"$NS"'.svc.cluster.local 2>/dev/null | grep -q 38412'; then
+    ok "_n2._sctp SRV record published"
+  else
+    note "SRV lookup unavailable through busybox nslookup; slice protocol verified above"
+  fi
+else
+  bad "no slice created for the SCTP service"
+fi
+kubectl -n "$NS" delete svc amf-n2-sctp --wait=false >/dev/null 2>&1
 
 # ---------------------------------------------------------------- T11
 head_ "T11 Service 삭제 -> owned EndpointSlice GC"

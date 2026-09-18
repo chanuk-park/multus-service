@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,6 +41,9 @@ func main() {
 		resync     time.Duration
 		probeAddr  string
 		metricsAdr string
+		ctrlAddr   string
+		refresh    time.Duration
+		pathMode   string
 	)
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"),
 		"name of the node this agent observes; usually injected via the downward API")
@@ -51,6 +55,13 @@ func main() {
 		"upper bound on how long a missed netlink event goes unnoticed; also the report heartbeat")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "liveness/readiness endpoint")
 	flag.StringVar(&metricsAdr, "metrics-bind-address", "0", "metrics endpoint; 0 disables")
+	flag.StringVar(&ctrlAddr, "controller-address", os.Getenv("CONTROLLER_ADDRESS"),
+		"controller health transport, host:port; empty observes locally without reporting")
+	flag.StringVar(&pathMode, "path-probe", agent.PathNone,
+		"path state source: none (Phase 3 default) or assume-ready "+
+			"(scaffold that reports every path up without probing; the real probe lands in Phase 4)")
+	flag.DurationVar(&refresh, "refresh", 1*time.Second,
+		"how often the full state is resent regardless of change; must stay well under the controller's health TTL")
 
 	zapOpts := zap.Options{Development: true}
 	zapOpts.BindFlags(flag.CommandLine)
@@ -99,14 +110,38 @@ func main() {
 		os.Exit(1)
 	}
 
+	// A fresh instance id per process is what lets the controller discard
+	// reports still in flight from a previous agent, without either side having
+	// to trust the other's clock.
+	instanceID := uuid.New().String()
+
+	var sink agent.Sink = agent.NopSink{}
+	if ctrlAddr != "" {
+		gs := &agent.GRPCSink{
+			Addr:       ctrlAddr,
+			NodeName:   nodeName,
+			InstanceID: instanceID,
+			Events:     events,
+			Refresh:    refresh,
+		}
+		if err := mgr.Add(gs); err != nil {
+			setupLog.Error(err, "registering health sink")
+			os.Exit(1)
+		}
+		sink = gs
+	} else {
+		setupLog.Info("no controller address; observing locally without reporting")
+	}
+
 	a := &agent.Agent{
 		Client:   mgr.GetClient(),
 		NodeName: nodeName,
 		Resolver: agentnetns.NewCache(resolver),
 		Monitor:  local.NewMonitor(256),
-		Sink:     agent.LogSink{Events: events},
+		Sink:     sink,
 		Events:   events,
 		Resync:   resync,
+		PathMode: pathMode,
 	}
 	if err := a.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "registering agent")
@@ -122,7 +157,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting agent", "node", nodeName, "runtime", endpoint)
+	setupLog.Info("starting agent", "node", nodeName, "runtime", endpoint,
+		"instance", instanceID, "controller", ctrlAddr)
 	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "manager exited")
 		os.Exit(1)

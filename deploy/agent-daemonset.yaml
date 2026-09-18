@@ -20,12 +20,26 @@ spec:
           image: boanlab/multus-service-agent:dev
           imagePullPolicy: IfNotPresent
           args:
-            - --resync=2s
+            - --resync=1s
+            # Full state is resent this often regardless of change, so health is
+            # a renewable lease rather than an event log.
+            #
+            # Two relationships matter: refresh must stay well under the
+            # controller's --health-ttl, or unchanged attachments expire between
+            # snapshots; and resync must be no larger than refresh, so a change
+            # is sent as a delta immediately instead of waiting for the next
+            # full send.
+            - --refresh=2s
+            # Phase 3 scaffold: no probe exists yet, so path state is asserted
+            # rather than measured. Phase 4 replaces this with a real probe.
+            - --path-probe=assume-ready
             - --events-file=-
             - --zap-log-level=info
           env:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: CONTROLLER_ADDRESS
+              value: multus-service-controller.multus-service-system.svc:9090
           securityContext:
             # Entering another network namespace needs CAP_SYS_ADMIN, and both
             # the CRI socket (root:root 0660) and the namespace files under

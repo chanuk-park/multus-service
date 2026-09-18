@@ -19,7 +19,8 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --leader-elect=true
-            - --health-ttl=15s
+            - --health-ttl=5s
+            - --health-bind-address=:9090
             # JSONL measurement stream. Sent to stdout so it can be collected
             # with `kubectl logs` during an evaluation run.
             - --events-file=-
@@ -27,6 +28,7 @@ spec:
           ports:
             - {name: metrics, containerPort: 8080}
             - {name: probe, containerPort: 8081}
+            - {name: health, containerPort: 9090}
           livenessProbe:
             httpGet: {path: /healthz, port: probe}
             initialDelaySeconds: 10
@@ -46,3 +48,17 @@ spec:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
           effect: NoSchedule
+---
+# The agents report here. A ClusterIP is enough: the transport carries health
+# observations for attachments the controller already knows about, so it is not
+# a discovery surface.
+apiVersion: v1
+kind: Service
+metadata:
+  name: multus-service-controller
+  namespace: multus-service-system
+  labels: {app: multus-service-controller}
+spec:
+  selector: {app: multus-service-controller}
+  ports:
+    - {name: health, port: 9090, targetPort: health, protocol: TCP}

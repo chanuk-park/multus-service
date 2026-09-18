@@ -13,12 +13,16 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/boanlab/multus-service/internal/attach"
 	"github.com/boanlab/multus-service/internal/model"
@@ -33,6 +37,15 @@ type ServiceReconciler struct {
 	Recorder record.EventRecorder
 	Health   *HealthStore
 	Events   *obs.Recorder
+
+	// Registry is the authority an agent report is checked against. The
+	// reconciler is the only writer: attachments come from Service + Pod +
+	// network-status, never from what an agent claims to see.
+	Registry *Registry
+
+	// HealthEvents re-enqueues a Service when its health input changed.
+	// Readiness would otherwise only move on the next Service or Pod event.
+	HealthEvents chan event.TypedGenericEvent[*corev1.Service]
 }
 
 // Reconcile brings the owned EndpointSlices in line with the Pods currently
@@ -42,13 +55,29 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var svc corev1.Service
 	if err := r.Get(ctx, req.NamespacedName, &svc); err != nil {
-		// Owned slices carry an ownerReference to the Service, so deletion is
-		// handled by garbage collection rather than here.
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// Owned slices carry an ownerReference to the Service, so deletion
+			// is handled by garbage collection. The registry is not, so a
+			// deleted Service must stop vouching for its attachments.
+			r.Registry.RemoveService(req.NamespacedName)
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
 	}
 
 	if !attach.Managed(&svc) {
+		r.Registry.RemoveService(req.NamespacedName)
 		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "annotation removed")
+	}
+
+	// Probe configuration belongs to the NAD. Honouring it here would break the
+	// assumption a shared Node-scope path domain rests on: two Services on one
+	// NAD could then name different health targets while sharing one path state.
+	if stray := attach.ProbeConfigOnService(&svc); len(stray) > 0 {
+		r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "ProbeConfigOnService",
+			"%v belong on the NetworkAttachmentDefinition, not on a Service; ignoring them. "+
+				"Probe settings are per-network because a Node-scope path domain is shared by every "+
+				"attachment of one NAD on one node", stray)
 	}
 
 	if err := validateService(&svc); err != nil {
@@ -56,6 +85,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		r.Events.Emit("service_invalid",
 			"namespace", svc.Namespace, "service", svc.Name, "error", err.Error())
 		// Refuse to publish anything for a Service that breaks the invariants.
+		r.Registry.RemoveService(req.NamespacedName)
 		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "invalid service")
 	}
 
@@ -63,12 +93,14 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "InvalidNetwork",
 			"annotation %s: %v", AnnotationNetwork, err)
+		r.Registry.RemoveService(req.NamespacedName)
 		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "invalid network annotation")
 	}
 
 	sel, err := attach.Selector(&svc)
 	if err != nil {
 		r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "InvalidSelector", "%v", err)
+		r.Registry.RemoveService(req.NamespacedName)
 		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "unusable workload selector")
 	}
 
@@ -116,11 +148,16 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	// Probe scope is Endpoint for now. Phase 6 resolves it per NAD from the
-	// secondary-service.boanlab.io/probe-scope annotation; until a Node-scope
-	// probe exists there is nothing for a Node key to read, and Endpoint scope
-	// is the one that is correct without a topology assumption.
+	// Probe scope is Endpoint for now. Phase 6 resolves it per NAD via
+	// attach.ParseProbeScope; until a Node-scope probe exists there is nothing
+	// for a Node key to read, and Endpoint scope is the one that holds without
+	// a topology assumption.
 	scope := model.ScopeEndpoint
+
+	// Register before publishing: an agent may report the moment a slice
+	// appears, and a report for an attachment the registry has not yet seen
+	// would be rejected.
+	r.Registry.SetService(req.NamespacedName, atts, scope)
 
 	want, readiness, warnings := desiredSlices(&svc, nad, scope, atts, r.Health)
 	for _, w := range warnings {
@@ -184,12 +221,31 @@ func (r *ServiceReconciler) dropOwnedSlices(ctx context.Context, svc *corev1.Ser
 	return nil
 }
 
-// SetupWithManager wires the Service, owned-slice and Pod watches.
+// Enqueue asks for a Service to be reconciled because its health input moved.
+// It never blocks: a full channel already means a reconcile is pending, and
+// reconcile re-reads everything anyway.
+func (r *ServiceReconciler) Enqueue(key types.NamespacedName) {
+	if r.HealthEvents == nil {
+		return
+	}
+	select {
+	case r.HealthEvents <- event.TypedGenericEvent[*corev1.Service]{
+		Object: &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name: key.Name, Namespace: key.Namespace,
+		}},
+	}:
+	default:
+	}
+}
+
+// SetupWithManager wires the Service, owned-slice, Pod and health watches.
 func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("secondary-service").
 		For(&corev1.Service{}).
 		Owns(&discoveryv1.EndpointSlice{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.servicesForPod)).
+		WatchesRawSource(source.Channel(r.HealthEvents,
+			&handler.TypedEnqueueRequestForObject[*corev1.Service]{})).
 		Complete(r)
 }

@@ -24,6 +24,17 @@ import (
 	"github.com/boanlab/multus-service/internal/obs"
 )
 
+// PathMode values.
+const (
+	// PathNone emits no path state. Endpoints then stay not-ready, which is
+	// correct: nothing has checked whether the address is reachable.
+	PathNone = "none"
+	// PathAssumeReady reports every path as up without probing. A Phase 3
+	// scaffold for exercising the transport end to end; replaced by the real
+	// probe in Phase 4.
+	PathAssumeReady = "assume-ready"
+)
+
 // Agent observes every secondary attachment belonging to a managed Service
 // whose Pod runs on this node.
 type Agent struct {
@@ -34,10 +45,15 @@ type Agent struct {
 	Sink     Sink
 	Events   *obs.Recorder
 
-	// Resync bounds how long a missed netlink event can go unnoticed, and
-	// doubles as the report heartbeat that keeps the controller's freshness
-	// check satisfied while nothing changes.
+	// Resync bounds how long a missed netlink event can go unnoticed.
 	Resync time.Duration
+
+	// PathMode is a Phase 3 stand-in for the active probe that arrives in
+	// Phase 4. "assume-ready" emits an Endpoint-scope PathHealth that is always
+	// true, which exercises the transport and the join without claiming to have
+	// measured anything. The default emits no path state at all, so endpoints
+	// stay not-ready -- the honest answer while nothing probes the path.
+	PathMode string
 
 	mu   sync.Mutex
 	prev map[string]bool // attachment ID -> last reported local_ready
@@ -101,6 +117,8 @@ func (a *Agent) sweep(ctx context.Context) {
 	handles := map[string]agentnetns.Handle{}
 
 	live := map[string]bool{}
+	changed := map[string]bool{}
+	locals := make([]model.LocalHealth, 0, len(atts))
 	now := time.Now()
 
 	for _, at := range atts {
@@ -150,20 +168,54 @@ func (a *Agent) sweep(ctx context.Context) {
 			ObservedAt:      now,
 		}
 		live[r.AttachmentID] = true
+		locals = append(locals, r)
 
-		a.transition(r, h)
-		if err := a.Sink.Local(ctx, r); err != nil {
-			lg.V(1).Info("reporting", "attachment", r.AttachmentID, "err", err.Error())
+		if a.transition(r, h) {
+			changed[r.AttachmentID] = true
+		}
+		a.Events.Emit("local_health",
+			"attachment_id", r.AttachmentID, "pod_uid", r.PodUID,
+			"namespace", r.Namespace, "pod", r.PodName, "nad", r.NAD,
+			"interface", r.Interface, "ip", r.IP, "node", r.NodeName,
+			"local_ready", r.Ready(),
+			"interface_exists", r.InterfaceExists,
+			"address_present", r.AddressPresent,
+			"link_usable", r.LinkUsable,
+			"observed_at", r.ObservedAt.UnixNano())
+	}
+
+	retired := a.retire(live, handles)
+
+	// An empty path list still means "everything this node currently knows",
+	// which is what makes the controller's atomic snapshot replacement correct.
+	var paths []model.PathHealth
+	if a.PathMode == PathAssumeReady {
+		paths = make([]model.PathHealth, 0, len(locals))
+		for _, r := range locals {
+			paths = append(paths, model.PathHealth{
+				Scope:      model.ScopeEndpoint,
+				ScopeID:    r.AttachmentID,
+				NAD:        r.NAD,
+				Target:     "(assumed)",
+				PathReady:  true,
+				ObservedAt: now,
+			})
 		}
 	}
 
-	a.retire(live, handles)
+	if err := a.Sink.Publish(ctx, Snapshot{
+		Locals:  locals,
+		Paths:   paths,
+		Changed: changed,
+		Retired: retired,
+	}); err != nil {
+		lg.V(1).Info("publishing health", "err", err.Error())
+	}
 }
 
 // transition emits the anchor timestamps the evaluation measures detection
-// latency from. A report every resync is enough for freshness; a transition is
-// what marks the moment the fault became visible.
-func (a *Agent) transition(r model.LocalHealth, h agentnetns.Handle) {
+// latency from, and reports whether this attachment's readiness just moved.
+func (a *Agent) transition(r model.LocalHealth, h agentnetns.Handle) bool {
 	a.mu.Lock()
 	was, known := a.prev[r.AttachmentID]
 	a.prev[r.AttachmentID] = r.Ready()
@@ -174,10 +226,10 @@ func (a *Agent) transition(r model.LocalHealth, h agentnetns.Handle) {
 			"attachment_id", r.AttachmentID, "pod", r.PodName, "ip", r.IP,
 			"interface", r.Interface, "netns", h.Path, "sandbox", h.SandboxID,
 			"local_ready", r.Ready())
-		return
+		return true
 	}
 	if was == r.Ready() {
-		return
+		return false
 	}
 	event := "recovery_detected"
 	if !r.Ready() {
@@ -189,11 +241,12 @@ func (a *Agent) transition(r model.LocalHealth, h agentnetns.Handle) {
 		"interface_exists", r.InterfaceExists,
 		"address_present", r.AddressPresent,
 		"link_usable", r.LinkUsable)
+	return true
 }
 
 // retire forgets attachments that vanished, so a stale entry cannot be revived
 // by a late event and so the netns cache does not grow without bound.
-func (a *Agent) retire(live map[string]bool, handles map[string]agentnetns.Handle) {
+func (a *Agent) retire(live map[string]bool, handles map[string]agentnetns.Handle) []string {
 	a.mu.Lock()
 	gone := make([]string, 0)
 	for id := range a.prev {
@@ -218,6 +271,7 @@ func (a *Agent) retire(live map[string]bool, handles map[string]agentnetns.Handl
 			}
 		}
 	}
+	return gone
 }
 
 // targets returns every attachment on this node that a managed Service claims.

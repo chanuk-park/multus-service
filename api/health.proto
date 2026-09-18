@@ -5,42 +5,87 @@ package secondaryservice.v1;
 option go_package = "github.com/boanlab/multus-service/api/healthpb";
 
 // HealthReporter carries network observations from the node agents to the
-// controller. The agents measure; the controller decides. Nothing here
-// expresses a readiness verdict -- that is computed centrally, because it also
-// depends on Pod state the agent does not watch.
+// controller. The agents measure; the controller decides.
 //
-// Local state and path state are separate streams because they have different
-// cardinality, and collapsing them would hide that:
+// Two invariants shape this protocol.
 //
-//   local state   exists per attachment, always
-//   path state    Endpoint scope -> per attachment
-//                 Node scope     -> one per (node, NAD)
+// First, an agent report is not a discovery authority. The controller derives
+// the attachment set from Service + Pod + network-status and computes the
+// attachment id itself; a report can only update the health of something the
+// controller already knows about. A report naming an unknown attachment is
+// rejected, never used to create one.
 //
-// Under Node scope a single shared probe covers every attachment in the domain.
-// A message carrying both kinds would force the agent to copy one path result
-// into N per-Pod reports, which is the duplication the scope exists to remove --
-// and it would give each copy its own hysteresis, reintroducing the transition
-// skew that sharing is meant to eliminate.
+// Second, health state is a renewable lease, not an event log. An agent that
+// only spoke on change would go silent after a controller restart -- the state
+// would still be healthy, so nothing would change, and every endpoint would sit
+// at Unknown forever. Agents therefore resend a full snapshot on every connect
+// and refresh periodically.
 service HealthReporter {
-  // ReportLocal streams per-attachment observations from inside the Pod netns.
-  rpc ReportLocal(stream LocalHealth) returns (stream ReportAck);
-
-  // ReportPath streams probe results. Under Node scope one stream entry covers
-  // a whole (node, NAD) domain.
-  rpc ReportPath(stream PathHealth) returns (stream ReportAck);
+  // Sync is bidirectional so the controller can ask for a resync without the
+  // agent having to poll for permission. The reverse direction carries nothing
+  // else: this is a health transport, not a control protocol.
+  rpc Sync(stream HealthEnvelope) returns (stream HealthAck);
 }
 
-// LocalHealth is what one attachment's interface looks like from inside its
-// Pod netns. It is never observable from the host netns: macvlan and ipvlan
-// move the child device wholly into the Pod namespace, leaving nothing on the
-// host for netlink to watch.
+// HealthEnvelope wraps every message an agent sends.
+//
+// Local state and path state stay separate payloads because they have different
+// cardinality: local state is per attachment, always, while path state is per
+// attachment under Endpoint scope and per (node, NAD) under Node scope. Merging
+// them would force an agent to copy one shared Node-scope probe result into N
+// per-Pod reports -- the duplication the scope exists to remove -- and give each
+// copy its own hysteresis, reintroducing the transition skew that sharing is
+// meant to eliminate.
+message HealthEnvelope {
+  string node_name = 1;
+
+  // agent_instance_id is fresh for every agent process. Ordering and freshness
+  // must not depend on comparing a node's clock with the controller's, so the
+  // instance id and the sequence number carry that responsibility instead and
+  // observed_at is left purely for measurement.
+  string agent_instance_id = 2;
+
+  // sequence increases monotonically within one instance. A gRPC stream orders
+  // its own messages, but a reconnect can leave an old and a new stream briefly
+  // overlapping, and the pair (instance, sequence) resolves that without a
+  // clock.
+  uint64 sequence = 3;
+
+  oneof payload {
+    LocalHealth local = 10;
+    PathHealth path = 11;
+    AttachmentRetired retired = 12;
+    SnapshotBegin snapshot_begin = 13;
+    SnapshotEnd snapshot_end = 14;
+  }
+}
+
+// SnapshotBegin opens an atomic replacement of everything the controller holds
+// for this node.
+//
+// Without it, a controller that restarted while an agent was mid-send would
+// reconcile against a partial set and briefly publish the rest as not ready.
+// The controller buffers until SnapshotEnd and commits in one step.
+message SnapshotBegin {
+  uint64 epoch = 1;
+  // expected_local and expected_path let the controller notice a truncated
+  // snapshot instead of committing it.
+  uint32 expected_local = 2;
+  uint32 expected_path = 3;
+}
+
+message SnapshotEnd {
+  uint64 epoch = 1;
+}
+
+// LocalHealth is one attachment's interface state, observed from inside its Pod
+// netns. It is not observable from the host netns: macvlan and ipvlan move the
+// child device wholly into the Pod namespace.
 message LocalHealth {
-  // attachment_id is hash(pod_uid | nad | interface_name | ip).
-  //
-  // Without it, a report in flight while the sandbox was recreated would be
-  // applied to the new attachment, which may sit on a different interface with
-  // a different address. The controller recomputes this from the current
-  // network-status and drops any report that does not match.
+  // attachment_id is hash(pod_uid | nad | interface_name | ip), recomputed by
+  // the controller from the current network-status. A report whose id does not
+  // match a known attachment is rejected, which is what stops a report that was
+  // in flight across a sandbox recreate from landing on the new attachment.
   string attachment_id = 1;
 
   string pod_uid = 2;
@@ -51,62 +96,70 @@ message LocalHealth {
   string interface_name = 6;  // from network-status, never assumed to be net1
   string ip = 7;
 
-  // local_ready is the agent's verdict: all three checks below passed.
   bool local_ready = 8;
 
-  // The three checks are reported individually because they fail differently
-  // and the evaluation measures them separately. In particular, taking a link
-  // down leaves the IPv4 address in place, so address_present alone reports a
-  // dead interface as healthy.
+  // The three checks are reported individually because they fail differently.
+  // Taking a link down leaves the IPv4 address in place, so address_present
+  // alone reports a dead interface as healthy.
   bool interface_exists = 9;
   bool address_present = 10;
   bool link_usable = 11;
 
-  string node_name = 12;
-  int64 observed_at_unix_nano = 13;
+  // observed_at is for measurement only. Freshness is judged from when the
+  // controller accepted the report, so a skewed node clock cannot make a stale
+  // report look current or a current one look stale.
+  int64 observed_at_unix_nano = 12;
 }
 
 enum ProbeScope {
   PROBE_SCOPE_UNSPECIFIED = 0;
-  // One probe per attachment, sourced from that Pod's netns. Always correct.
+  // One probe per attachment, sourced from that Pod's netns. Correct without
+  // any topology assumption.
   PROBE_SCOPE_ENDPOINT = 1;
   // One probe per (node, NAD), shared by every attachment in the domain.
-  // Rests on the assumption that the host path represents the Pod path, which
-  // is false for macvlan and ipvlan toward same-node endpoints. Opt-in only.
+  //
+  // Sharing is only sound because probe configuration -- scope, health target
+  // and source interface -- is a property of the NAD and never of a Service.
+  // Two Services on one NAD with different health targets would otherwise be
+  // silently collapsed into one path state. Opt-in, and false for macvlan or
+  // ipvlan toward same-node endpoints.
   PROBE_SCOPE_NODE = 2;
 }
 
-// PathHealth is the result of an active probe. netlink cannot supply it: an
-// underlay blackhole breaks reachability while changing no local kernel state
-// at all, so both host and Pod netlink monitors stay silent through it.
+// PathHealth is an active probe result. netlink cannot supply it: an underlay
+// blackhole breaks reachability while changing no local kernel state at all.
 message PathHealth {
   ProbeScope scope = 1;
 
-  // scope_id is the attachment_id under Endpoint scope, and the domain id
+  // scope_id is the attachment_id under Endpoint scope and
   // hash(node_name | nad) under Node scope. The controller joins on it, so one
-  // Node-scope report satisfies every attachment in the domain without being
+  // Node-scope report serves every attachment in the domain without being
   // copied per Pod.
   string scope_id = 2;
 
-  string node_name = 3;
-  string nad = 4;
+  string nad = 3;
+  string target = 4;
 
-  // target is the health target the probe was sent to, recorded so a result can
-  // be attributed after the fact.
-  string target = 5;
+  // path_ready is post-hysteresis. The raw counters stay on the agent so a
+  // shared domain has exactly one hysteresis state rather than one per
+  // attachment.
+  bool path_ready = 5;
 
-  // path_ready is post-hysteresis. The raw counters stay on the agent; the
-  // controller consumes a debounced verdict so a shared Node-scope domain has
-  // exactly one hysteresis state rather than one per attachment.
-  bool path_ready = 6;
-
-  int64 observed_at_unix_nano = 7;
+  int64 observed_at_unix_nano = 6;
 }
 
-message ReportAck {
-  string id = 1;  // echoes attachment_id or scope_id
-  // accepted is false when the controller no longer recognises the subject,
-  // which tells the agent to re-resolve the Pod rather than keep reporting.
-  bool accepted = 2;
+// AttachmentRetired says an attachment is gone. Snapshots would eventually
+// remove it anyway; sending it immediately closes the window in which a stale
+// entry could still be read.
+message AttachmentRetired {
+  string attachment_id = 1;
+}
+
+message HealthAck {
+  // accepted_sequence is the highest sequence the controller has processed.
+  uint64 accepted_sequence = 1;
+  // resync_required asks the agent to send a full snapshot, e.g. after a
+  // controller restart or when a report arrived for an unknown subject.
+  bool resync_required = 2;
   string reason = 3;
 }

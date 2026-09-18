@@ -90,3 +90,16 @@ func (a Attachment) PathKey(scope ProbeScope) string {
 	}
 	return a.ID()
 }
+
+// ReportOrigin identifies which agent process produced a report and where it
+// sat in that process's stream.
+//
+// Ordering and freshness deliberately avoid comparing a node's clock with the
+// controller's. A restarted agent gets a new instance id, and sequence numbers
+// are monotonic only within one instance, so the pair orders reports without a
+// shared clock. ObservedAt stays on the report for measurement only.
+type ReportOrigin struct {
+	NodeName      string
+	AgentInstance string
+	Sequence      uint64
+}
