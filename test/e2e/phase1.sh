@@ -210,7 +210,7 @@ fi
 k delete pod amf-double --wait=false >/dev/null 2>&1
 
 # ---------------------------------------------------------------- T10
-head_ "T10 두 Pod 가 같은 주소를 주장하면 하나만 게시하고 경고"
+head_ "T10 두 Pod 가 같은 주소를 주장하면 둘 다 게시하지 않고 경고"
 kubectl apply -f "$FIXTURES/nad-static.yaml" >/dev/null
 DUP_B=${NODE_B:-$NODE_A}
 cat <<EOP | kubectl apply -f - >/dev/null
@@ -243,10 +243,16 @@ EOP
 retry 180 '[ "$(k get pod dup-a dup-b --no-headers 2>/dev/null | grep -c Running)" = "2" ]' >/dev/null
 sleep 5
 dup_addrs=$(k get endpointslice amf-dup-secondary-ipv4 -o jsonpath='{range .endpoints[*]}{.addresses[0]}{"\n"}{end}' 2>/dev/null)
-if [ "$(echo "$dup_addrs" | grep -c '^10\.244\.77\.250$')" = "1" ] && [ "$(echo "$dup_addrs" | grep -c .)" = "1" ]; then
-  ok "10.244.77.250 claimed by dup-a and dup-b, published exactly once"
+if [ -z "$(echo "$dup_addrs" | grep -c . | grep -v '^0$')" ]; then
+  ok "10.244.77.250 claimed by dup-a and dup-b, neither published"
 else
-  bad "duplicate handling wrong" "$(echo "$dup_addrs" | tr '\n' ' ')"
+  bad "a conflicting address was published" "$(echo "$dup_addrs" | tr '\n' ' ')"
+fi
+dup_msg=$(k get events --field-selector reason=DuplicateAddress -o jsonpath='{.items[-1].message}' 2>/dev/null)
+if [ -n "$dup_msg" ] && grep -q dup-a <<<"$dup_msg" && grep -q dup-b <<<"$dup_msg"; then
+  ok "both claimants named in the event"
+else
+  bad "event does not name both claimants" "$dup_msg"
 fi
 if retry 30 'k get events --field-selector reason=DuplicateAddress 2>/dev/null | grep -q DuplicateAddress'; then
   ok "DuplicateAddress Warning event recorded"

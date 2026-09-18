@@ -76,3 +76,34 @@ subjects:
   - kind: ServiceAccount
     name: multus-service-controller
     namespace: multus-service-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: multus-service-agent
+  namespace: multus-service-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: multus-service-agent
+rules:
+  # The agent derives its own target set so it never disagrees with the
+  # controller about which Pods a Service claims. Read-only throughout: the
+  # agent measures and reports, it never writes Kubernetes state.
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: multus-service-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: multus-service-agent
+subjects:
+  - kind: ServiceAccount
+    name: multus-service-agent
+    namespace: multus-service-system

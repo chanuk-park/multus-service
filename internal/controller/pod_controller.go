@@ -9,6 +9,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/boanlab/multus-service/internal/attach"
 )
 
 // servicesForPod maps a Pod event to the Services that may publish it.
@@ -32,14 +34,10 @@ func (r *ServiceReconciler) servicesForPod(ctx context.Context, obj client.Objec
 	var reqs []ctrl.Request
 	for i := range svcs.Items {
 		svc := &svcs.Items[i]
-		if _, managed := svc.Annotations[AnnotationNetwork]; !managed {
+		if !attach.Managed(svc) {
 			continue
 		}
-		raw := svc.Annotations[AnnotationSelector]
-		if raw == "" {
-			continue
-		}
-		sel, err := labels.Parse(raw)
+		sel, err := attach.Selector(svc)
 		if err != nil {
 			continue
 		}

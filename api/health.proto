@@ -5,59 +5,107 @@ package secondaryservice.v1;
 option go_package = "github.com/boanlab/multus-service/api/healthpb";
 
 // HealthReporter carries network observations from the node agents to the
-// controller. The agents measure; the controller decides. Nothing in this
-// protocol expresses a readiness verdict -- that is computed centrally, because
-// it also depends on Pod state the agent does not watch.
+// controller. The agents measure; the controller decides. Nothing here
+// expresses a readiness verdict -- that is computed centrally, because it also
+// depends on Pod state the agent does not watch.
+//
+// Local state and path state are separate streams because they have different
+// cardinality, and collapsing them would hide that:
+//
+//   local state   exists per attachment, always
+//   path state    Endpoint scope -> per attachment
+//                 Node scope     -> one per (node, NAD)
+//
+// Under Node scope a single shared probe covers every attachment in the domain.
+// A message carrying both kinds would force the agent to copy one path result
+// into N per-Pod reports, which is the duplication the scope exists to remove --
+// and it would give each copy its own hysteresis, reintroducing the transition
+// skew that sharing is meant to eliminate.
 service HealthReporter {
-  // Report streams observations. A stream keeps the per-report cost low and
-  // lets the controller notice a dead agent as a closed stream rather than
-  // waiting for reports to age out.
-  rpc Report(stream EndpointHealth) returns (stream ReportAck);
+  // ReportLocal streams per-attachment observations from inside the Pod netns.
+  rpc ReportLocal(stream LocalHealth) returns (stream ReportAck);
+
+  // ReportPath streams probe results. Under Node scope one stream entry covers
+  // a whole (node, NAD) domain.
+  rpc ReportPath(stream PathHealth) returns (stream ReportAck);
 }
 
-message EndpointHealth {
-  string pod_uid = 1;
-  string namespace = 2;
-  string pod_name = 3;
-
-  string nad = 4;             // canonical "ns/name"
-  string interface_name = 5;  // from network-status, never assumed to be net1
-  string ip = 6;
-
-  // local_ready is observed from inside the Pod netns: the interface exists,
-  // carries the expected address, and the link is usable. All three matter --
-  // taking a link down leaves the IPv4 address in place, so watching addresses
-  // alone reports a dead interface as healthy.
-  bool local_ready = 7;
-
-  // path_ready is the result of an active probe sourced from the Pod netns.
-  // netlink cannot supply it: an underlay blackhole changes no local state.
-  bool path_ready = 8;
-
-  int64 observed_at_unix_nano = 9;
-
+// LocalHealth is what one attachment's interface looks like from inside its
+// Pod netns. It is never observable from the host netns: macvlan and ipvlan
+// move the child device wholly into the Pod namespace, leaving nothing on the
+// host for netlink to watch.
+message LocalHealth {
   // attachment_id is hash(pod_uid | nad | interface_name | ip).
   //
-  // Without it, a report that was in flight while the sandbox was recreated
-  // would be applied to the new attachment, which has a different address on a
-  // different interface. The controller recomputes this value from the current
+  // Without it, a report in flight while the sandbox was recreated would be
+  // applied to the new attachment, which may sit on a different interface with
+  // a different address. The controller recomputes this from the current
   // network-status and drops any report that does not match.
-  string attachment_id = 10;
+  string attachment_id = 1;
 
-  // node_name lets the controller attribute a report, and lets it tell a dead
-  // agent apart from a dead path when every attachment on one node goes quiet.
-  string node_name = 11;
+  string pod_uid = 2;
+  string namespace = 3;
+  string pod_name = 4;
 
-  // probe_scope records how path_ready was obtained: "endpoint" when the probe
-  // was sourced from this Pod's netns, "node" when it came from a shared
-  // per-(node, NAD) probe. The distinction has to survive into the data,
-  // because a node-scoped result rests on a topology assumption.
-  string probe_scope = 12;
+  string nad = 5;             // canonical "ns/name"
+  string interface_name = 6;  // from network-status, never assumed to be net1
+  string ip = 7;
+
+  // local_ready is the agent's verdict: all three checks below passed.
+  bool local_ready = 8;
+
+  // The three checks are reported individually because they fail differently
+  // and the evaluation measures them separately. In particular, taking a link
+  // down leaves the IPv4 address in place, so address_present alone reports a
+  // dead interface as healthy.
+  bool interface_exists = 9;
+  bool address_present = 10;
+  bool link_usable = 11;
+
+  string node_name = 12;
+  int64 observed_at_unix_nano = 13;
+}
+
+enum ProbeScope {
+  PROBE_SCOPE_UNSPECIFIED = 0;
+  // One probe per attachment, sourced from that Pod's netns. Always correct.
+  PROBE_SCOPE_ENDPOINT = 1;
+  // One probe per (node, NAD), shared by every attachment in the domain.
+  // Rests on the assumption that the host path represents the Pod path, which
+  // is false for macvlan and ipvlan toward same-node endpoints. Opt-in only.
+  PROBE_SCOPE_NODE = 2;
+}
+
+// PathHealth is the result of an active probe. netlink cannot supply it: an
+// underlay blackhole breaks reachability while changing no local kernel state
+// at all, so both host and Pod netlink monitors stay silent through it.
+message PathHealth {
+  ProbeScope scope = 1;
+
+  // scope_id is the attachment_id under Endpoint scope, and the domain id
+  // hash(node_name | nad) under Node scope. The controller joins on it, so one
+  // Node-scope report satisfies every attachment in the domain without being
+  // copied per Pod.
+  string scope_id = 2;
+
+  string node_name = 3;
+  string nad = 4;
+
+  // target is the health target the probe was sent to, recorded so a result can
+  // be attributed after the fact.
+  string target = 5;
+
+  // path_ready is post-hysteresis. The raw counters stay on the agent; the
+  // controller consumes a debounced verdict so a shared Node-scope domain has
+  // exactly one hysteresis state rather than one per attachment.
+  bool path_ready = 6;
+
+  int64 observed_at_unix_nano = 7;
 }
 
 message ReportAck {
-  string attachment_id = 1;
-  // accepted is false when the controller no longer recognises the attachment,
+  string id = 1;  // echoes attachment_id or scope_id
+  // accepted is false when the controller no longer recognises the subject,
   // which tells the agent to re-resolve the Pod rather than keep reporting.
   bool accepted = 2;
   string reason = 3;

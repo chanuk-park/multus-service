@@ -4,44 +4,80 @@ import (
 	"github.com/boanlab/multus-service/internal/model"
 )
 
-// Readiness is the published ready value plus the reason behind it. The reason
-// is what makes the event stream diagnosable after the fact.
+// Readiness is the published ready value plus why. The reason is what makes the
+// event stream diagnosable after the fact, and it keeps the two halves of the
+// health state visible rather than collapsed into one boolean.
 type Readiness struct {
 	Ready  bool
 	Reason string
-	Health model.HealthState
+
+	Local model.State
+	Path  model.State
 }
 
 // ComputeReady decides whether one attachment may appear in DNS.
 //
-//	Ready = PodReady AND LocalReady AND PathReady AND report is fresh
+//	Ready = PodReady
+//	     && LocalFresh && LocalReady
+//	     && PathFresh  && PathReady
 //
-// Every term is required, and each covers a blind spot the others do not:
-// PodReady covers the workload, LocalReady covers the interface inside the Pod
-// netns, PathReady covers reachability, and freshness covers the agent itself.
+// The five terms cover five different blind spots, and none implies another:
+// PodReady covers the workload but rides the primary interface; LocalReady
+// covers the secondary interface but only its local kernel state; PathReady
+// covers reachability, which no local state reflects; and the two freshness
+// terms cover the agent itself, so a dead agent is not read as healthy.
 //
-// Until a node agent exists, no report is ever fresh, so every endpoint stays
-// ready=false. That is the correct Phase 1 behaviour, not a placeholder: an
-// address nobody has checked must not be advertised.
-func ComputeReady(a model.Attachment, hs *HealthStore) Readiness {
-	state := hs.State(a.ID())
+// Path state is looked up under the scope's key. Under Node scope that is the
+// (node, NAD) domain, so one shared probe result serves every attachment in the
+// domain -- read here rather than copied into each report.
+func ComputeReady(a model.Attachment, scope model.ProbeScope, hs *HealthStore) Readiness {
+	pathKey := a.PathKey(scope)
+	r := Readiness{
+		Local: hs.LocalState(a.ID()),
+		Path:  hs.PathState(pathKey),
+	}
 
 	if !a.PodReady {
-		return Readiness{Ready: false, Reason: "PodNotReady", Health: state}
+		r.Reason = "PodNotReady"
+		return r
 	}
 
-	rep, fresh := hs.Get(a.ID())
+	local, fresh := hs.Local(a.ID())
 	if !fresh {
-		if rep.AttachmentID == "" {
-			return Readiness{Ready: false, Reason: "NoHealthReport", Health: state}
+		if local.AttachmentID == "" {
+			r.Reason = "NoLocalReport"
+		} else {
+			r.Reason = "LocalReportStale"
 		}
-		return Readiness{Ready: false, Reason: "HealthReportStale", Health: state}
+		return r
 	}
-	if !rep.LocalReady {
-		return Readiness{Ready: false, Reason: "LocalNotReady", Health: state}
+	if !local.Ready() {
+		switch {
+		case !local.InterfaceExists:
+			r.Reason = "InterfaceMissing"
+		case !local.LinkUsable:
+			r.Reason = "LinkDown"
+		default:
+			r.Reason = "AddressMissing"
+		}
+		return r
 	}
-	if !rep.PathReady {
-		return Readiness{Ready: false, Reason: "PathNotReady", Health: state}
+
+	path, fresh := hs.Path(pathKey)
+	if !fresh {
+		if path.ScopeID == "" {
+			r.Reason = "NoPathReport"
+		} else {
+			r.Reason = "PathReportStale"
+		}
+		return r
 	}
-	return Readiness{Ready: true, Reason: "Healthy", Health: state}
+	if !path.PathReady {
+		r.Reason = "PathNotReady"
+		return r
+	}
+
+	r.Ready = true
+	r.Reason = "Healthy"
+	return r
 }

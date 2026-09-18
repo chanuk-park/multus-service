@@ -1,22 +1,48 @@
 package model
 
-import "time"
-
-// HealthState is the controller's internal view of an attachment.
-//
-// EndpointSlice can only express ready true/false, but the controller needs a
-// third value: "no fresh report". A dead agent and a failing path both end up
-// as ready=false, yet they are different events and are recorded as such.
-type HealthState string
-
-const (
-	HealthHealthy   HealthState = "Healthy"
-	HealthUnhealthy HealthState = "Unhealthy"
-	HealthUnknown   HealthState = "Unknown"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"time"
 )
 
-// Report is one health observation from a node agent.
-type Report struct {
+// ProbeScope says how a path result was obtained. It has to survive into the
+// data: a Node-scope result rests on the assumption that the host path
+// represents the Pod path, which is false for macvlan and ipvlan toward
+// same-node endpoints.
+type ProbeScope string
+
+const (
+	ScopeEndpoint ProbeScope = "Endpoint"
+	ScopeNode     ProbeScope = "Node"
+)
+
+// State is the controller's view of one half of an attachment's health.
+//
+// EndpointSlice can only express ready true/false, but the controller needs a
+// third value. A dead agent and a failing probe both drive ready=false, yet
+// they are different events and the evaluation must tell them apart.
+type State string
+
+const (
+	StateHealthy   State = "Healthy"
+	StateUnhealthy State = "Unhealthy"
+	StateUnknown   State = "Unknown"
+)
+
+// PathDomainID identifies a Node-scope probe domain: one shared probe, one
+// shared hysteresis, for every attachment of one NAD on one node.
+func PathDomainID(nodeName, nad string) string {
+	h := sha256.New()
+	h.Write([]byte(nodeName))
+	h.Write([]byte{0})
+	h.Write([]byte(nad))
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// LocalHealth is one attachment's interface state, observed from inside its
+// Pod netns. Cardinality is always one per attachment.
+type LocalHealth struct {
 	AttachmentID string
 	PodUID       string
 	Namespace    string
@@ -24,16 +50,43 @@ type Report struct {
 	NAD          string
 	Interface    string
 	IP           string
+	NodeName     string
 
-	// LocalReady is observed from inside the Pod netns: the interface exists,
-	// carries the expected address, and the link is usable. All three are
-	// needed -- bringing a link down leaves the IPv4 address in place, so
-	// address state alone reports a dead interface as healthy.
-	LocalReady bool
+	// The three checks are kept separate because they fail differently. Taking
+	// a link down leaves the IPv4 address in place, so AddressPresent alone
+	// reports a dead interface as healthy.
+	InterfaceExists bool
+	AddressPresent  bool
+	LinkUsable      bool
 
-	// PathReady is the result of an active probe. netlink cannot supply it:
-	// an underlay blackhole changes no local kernel state at all.
+	ObservedAt time.Time
+}
+
+// Ready is the agent's verdict for this attachment's local state.
+func (l LocalHealth) Ready() bool {
+	return l.InterfaceExists && l.AddressPresent && l.LinkUsable
+}
+
+// PathHealth is an active probe result. Cardinality depends on scope: one per
+// attachment under Endpoint scope, one per (node, NAD) under Node scope.
+type PathHealth struct {
+	Scope ProbeScope
+	// ScopeID is an attachment ID under Endpoint scope and a PathDomainID under
+	// Node scope. The controller joins on it, so a Node-scope result is stored
+	// once and read by every attachment in the domain.
+	ScopeID   string
+	NodeName  string
+	NAD       string
+	Target    string
 	PathReady bool
 
 	ObservedAt time.Time
+}
+
+// PathKey returns the key an attachment reads its path state under.
+func (a Attachment) PathKey(scope ProbeScope) string {
+	if scope == ScopeNode {
+		return PathDomainID(a.NodeName, a.NAD)
+	}
+	return a.ID()
 }

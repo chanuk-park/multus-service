@@ -13,7 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -21,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/boanlab/multus-service/internal/attach"
 	"github.com/boanlab/multus-service/internal/model"
 	"github.com/boanlab/multus-service/internal/multus"
 	"github.com/boanlab/multus-service/internal/obs"
@@ -47,8 +47,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	nadRef, managed := svc.Annotations[AnnotationNetwork]
-	if !managed {
+	if !attach.Managed(&svc) {
 		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "annotation removed")
 	}
 
@@ -60,24 +59,17 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "invalid service")
 	}
 
-	nad, err := multus.CanonicalNAD(nadRef, svc.Namespace)
+	nad, err := attach.NAD(&svc)
 	if err != nil {
 		r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "InvalidNetwork",
 			"annotation %s: %v", AnnotationNetwork, err)
 		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "invalid network annotation")
 	}
 
-	selRaw, ok := svc.Annotations[AnnotationSelector]
-	if !ok || selRaw == "" {
-		r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "MissingSelector",
-			"annotation %s is required; an empty selector would match every Pod", AnnotationSelector)
-		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "missing workload selector")
-	}
-	sel, err := labels.Parse(selRaw)
+	sel, err := attach.Selector(&svc)
 	if err != nil {
-		r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "InvalidSelector",
-			"annotation %s=%q: %v", AnnotationSelector, selRaw, err)
-		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "invalid workload selector")
+		r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "InvalidSelector", "%v", err)
+		return ctrl.Result{}, r.dropOwnedSlices(ctx, &svc, "unusable workload selector")
 	}
 
 	var pods corev1.PodList
@@ -91,16 +83,10 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	atts := make([]model.Attachment, 0, len(pods.Items))
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !eligible(pod) {
+		if !attach.Eligible(pod) {
 			continue
 		}
-		list, err := multus.Parse(pod.Annotations[multus.StatusAnnotation])
-		if err != nil {
-			r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "BadNetworkStatus",
-				"pod %s: %v", pod.Name, err)
-			continue
-		}
-		entry, err := multus.Select(list, nad)
+		found, err := attach.FromPod(pod, nad)
 		if err != nil {
 			switch {
 			case errors.Is(err, multus.ErrNoAttachment):
@@ -114,33 +100,29 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					"namespace", svc.Namespace, "service", svc.Name,
 					"pod", pod.Name, "nad", nad, "error", err.Error())
 			default:
-				lg.Error(err, "selecting attachment", "pod", pod.Name)
+				r.Recorder.Eventf(&svc, corev1.EventTypeWarning, "BadNetworkStatus",
+					"pod %s: %v", pod.Name, err)
+				lg.Error(err, "deriving attachment", "pod", pod.Name)
 			}
 			continue
 		}
-
-		ready := podReady(pod)
-		for _, ip := range entry.Addresses() {
-			a := model.Attachment{
-				PodUID:       pod.UID,
-				PodName:      pod.Name,
-				PodNamespace: pod.Namespace,
-				NodeName:     pod.Spec.NodeName,
-				NAD:          nad,
-				Interface:    entry.Interface,
-				IP:           ip,
-				PodReady:     ready,
-			}
+		for _, a := range found {
 			atts = append(atts, a)
 			r.Events.Emit("attachment_discovered",
 				"namespace", svc.Namespace, "service", svc.Name,
 				"pod", pod.Name, "pod_uid", string(pod.UID),
-				"nad", nad, "interface", entry.Interface, "ip", ip,
-				"attachment_id", a.ID(), "pod_ready", ready)
+				"nad", nad, "interface", a.Interface, "ip", a.IP,
+				"attachment_id", a.ID(), "pod_ready", a.PodReady)
 		}
 	}
 
-	want, readiness, warnings := desiredSlices(&svc, nad, atts, r.Health)
+	// Probe scope is Endpoint for now. Phase 6 resolves it per NAD from the
+	// secondary-service.boanlab.io/probe-scope annotation; until a Node-scope
+	// probe exists there is nothing for a Node key to read, and Endpoint scope
+	// is the one that is correct without a topology assumption.
+	scope := model.ScopeEndpoint
+
+	want, readiness, warnings := desiredSlices(&svc, nad, scope, atts, r.Health)
 	for _, w := range warnings {
 		r.Recorder.Event(&svc, corev1.EventTypeWarning, w.Reason, w.Message)
 		r.Events.Emit("attachment_warning",
@@ -174,45 +156,8 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-// validateService enforces the two invariants the whole design rests on.
-//
-// A selector would hand the Service to the built-in EndpointSlice controller,
-// which creates its own slice from primary Pod IPs; CoreDNS merges every slice
-// carrying the same service-name label, so the primary address would appear in
-// the answer next to the secondary one. A ClusterIP would put kube-proxy in the
-// path, which cannot forward to addresses it knows nothing about.
-func validateService(svc *corev1.Service) error {
-	if svc.Spec.ClusterIP != corev1.ClusterIPNone {
-		return fmt.Errorf("service must be headless (clusterIP: None), got %q", svc.Spec.ClusterIP)
-	}
-	if len(svc.Spec.Selector) > 0 {
-		return errors.New("service must not set spec.selector; " +
-			"the built-in EndpointSlice controller would publish primary Pod IPs alongside the secondary ones. " +
-			"Use the " + AnnotationSelector + " annotation instead")
-	}
-	return nil
-}
-
-// eligible filters out Pods that must not appear in a slice.
-func eligible(pod *corev1.Pod) bool {
-	if pod.DeletionTimestamp != nil {
-		return false
-	}
-	switch pod.Status.Phase {
-	case corev1.PodSucceeded, corev1.PodFailed:
-		return false
-	}
-	return true
-}
-
-func podReady(pod *corev1.Pod) bool {
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
-}
+// validateService enforces the invariants; see attach.Validate for the reasons.
+func validateService(svc *corev1.Service) error { return attach.Validate(svc) }
 
 // dropOwnedSlices removes every slice this controller owns for the Service,
 // used when the Service stops being managed or stops being valid.

@@ -14,23 +14,21 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/boanlab/multus-service/internal/attach"
 	"github.com/boanlab/multus-service/internal/model"
 )
 
+// The annotation contract lives in internal/attach, shared with the node agent
+// so the two can never disagree about which Pods a Service claims.
 const (
-	// AnnotationNetwork names the NetworkAttachmentDefinition whose addresses
-	// this Service publishes. Bare names resolve in the Service's namespace.
-	AnnotationNetwork = "secondary-service.boanlab.io/network"
-	// AnnotationSelector is the label selector choosing the workload Pods.
-	// It lives in an annotation, not spec.selector, because spec.selector would
-	// hand the Service to the built-in EndpointSlice controller, which would
-	// then publish primary Pod IPs alongside ours.
-	AnnotationSelector = "secondary-service.boanlab.io/workload-selector"
-
+	AnnotationNetwork  = attach.AnnotationNetwork
+	AnnotationSelector = attach.AnnotationSelector
 	// ManagedBy marks slices this controller owns. The built-in controller only
 	// touches slices carrying its own value, so the two never collide.
-	ManagedBy = "secondary-service.boanlab.io"
+	ManagedBy = attach.ManagedBy
+)
 
+const (
 	// sliceNetworkAnnotation records which NAD a slice came from. The NAD name
 	// contains "/", so it cannot be a label value.
 	sliceNetworkAnnotation = "secondary-service.boanlab.io/network"
@@ -96,6 +94,7 @@ func servicePorts(svc *corev1.Service) ([]discoveryv1.EndpointPort, []warning) {
 func desiredSlices(
 	svc *corev1.Service,
 	nad string,
+	scope model.ProbeScope,
 	atts []model.Attachment,
 	hs *HealthStore,
 ) (map[string]*discoveryv1.EndpointSlice, []Readiness, []warning) {
@@ -123,22 +122,27 @@ func desiredSlices(
 		})
 
 		// Two Pods claiming one address is a real and easy misconfiguration:
-		// host-local IPAM allocates per node, so the same NAD subnet hands out
-		// the same address on every node it runs on. Publishing both would put
-		// a node-local address in a cluster-wide DNS answer, so the duplicates
-		// are dropped and reported rather than merged silently.
-		list, dups := dedupeByAddress(list)
-		dupIPs := make([]string, 0, len(dups))
-		for ip := range dups {
+		// host-local IPAM allocates per node, so one NAD subnet shared across
+		// nodes hands the same address to Pods on different nodes.
+		//
+		// Every claimant is withdrawn, not all-but-one. Picking a winner is
+		// deterministic but not correct: DNS carries the address alone, so a
+		// client has no way to reach the Pod the controller chose, and
+		// targetRef plays no part in forwarding. Both Pods still own the
+		// address in the data plane whatever the slice says. The only honest
+		// answer is to publish neither and say so.
+		list, conflicts := dropConflictingAddresses(list)
+		dupIPs := make([]string, 0, len(conflicts))
+		for ip := range conflicts {
 			dupIPs = append(dupIPs, ip)
 		}
 		sort.Strings(dupIPs)
 		for _, ip := range dupIPs {
-			pods := dups[ip]
 			warnings = append(warnings, warning{"DuplicateAddress", fmt.Sprintf(
-				"address %s is claimed by more than one Pod (%s); publishing only %s. "+
+				"address %s is claimed by %d Pods (%s); none of them is published. "+
+					"DNS carries the address alone, so no choice among them is reachable on purpose. "+
 					"Per-node IPAM on a subnet shared across nodes is the usual cause",
-				ip, strings.Join(pods[1:], ", "), pods[0])})
+				ip, len(conflicts[ip]), strings.Join(conflicts[ip], ", "))})
 		}
 
 		if len(list) > maxEndpointsPerSlice {
@@ -150,7 +154,7 @@ func desiredSlices(
 
 		eps := make([]discoveryv1.Endpoint, 0, len(list))
 		for _, a := range list {
-			r := ComputeReady(a, hs)
+			r := ComputeReady(a, scope, hs)
 			readiness = append(readiness, r)
 			ep := discoveryv1.Endpoint{
 				Addresses: []string{a.IP},
@@ -206,25 +210,33 @@ func desiredSlices(
 	return out, readiness, warnings
 }
 
-// dedupeByAddress keeps the first attachment per address and reports the losers.
-// Input must already be sorted by (IP, PodUID) so the winner is stable.
-func dedupeByAddress(list []model.Attachment) ([]model.Attachment, map[string][]string) {
+// dropConflictingAddresses removes every attachment whose address is claimed
+// more than once, and reports the claimants per address.
+//
+// Input must already be sorted by (IP, PodUID) so the reported order is stable.
+func dropConflictingAddresses(list []model.Attachment) ([]model.Attachment, map[string][]string) {
 	out := make([]model.Attachment, 0, len(list))
-	var dups map[string][]string
-	for i, a := range list {
-		if i > 0 && list[i-1].IP == a.IP {
-			if dups == nil {
-				dups = map[string][]string{}
-			}
-			if _, seen := dups[a.IP]; !seen {
-				dups[a.IP] = []string{list[i-1].PodName}
-			}
-			dups[a.IP] = append(dups[a.IP], a.PodName)
-			continue
+	var conflicts map[string][]string
+	for i := 0; i < len(list); {
+		j := i
+		for j < len(list) && list[j].IP == list[i].IP {
+			j++
 		}
-		out = append(out, a)
+		if j-i == 1 {
+			out = append(out, list[i])
+		} else {
+			if conflicts == nil {
+				conflicts = map[string][]string{}
+			}
+			pods := make([]string, 0, j-i)
+			for _, a := range list[i:j] {
+				pods = append(pods, a.PodName)
+			}
+			conflicts[list[i].IP] = pods
+		}
+		i = j
 	}
-	return out, dups
+	return out, conflicts
 }
 
 // comparable projections -- only the fields this controller manages are

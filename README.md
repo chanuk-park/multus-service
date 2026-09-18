@@ -76,7 +76,7 @@ spec:
 | `ready` | Always written explicitly. Never nil. |
 | Local state | Observed only from inside the Pod netns. |
 | Node scope | Shares the *path* probe across a `(node, NAD)`. It does **not** remove the netns entry — local observation stays per-Pod. |
-| Duplicate address | Two Pods claiming one address publish one endpoint, and the collision is reported. |
+| Duplicate address | Two Pods claiming one address: **neither** is published, and the collision is reported. |
 | Kernel bypass | DPDK / vfio-pci out of scope. |
 
 Two of those deserve their reasons spelled out, because they look like style
@@ -95,65 +95,105 @@ unknown advertises an unchecked address.
 
 ### Two things the API does that are easy to trip over
 
-**A selectorless headless Service is stored as dual-stack.** The API server
+**A selectorless headless Service is stored as dual-stack.** *(A lab note, not a
+design argument — the invariant below does not lean on it.)* The API server
 defaults it to `ipFamilyPolicy: RequireDualStack, ipFamilies: [IPv4, IPv6]`,
 while the same Service *with* a selector gets `SingleStack, [IPv4]`. On a
 single-stack cluster that means you cannot convert one into the other by
 patching — adding a selector is rejected with
 `spec.ipFamilies[1]: Invalid value: "IPv6": not configured on this cluster`.
 In practice the invariant is therefore violated at creation time, not by
-mutation, which is how `test/e2e/phase1.sh` exercises it.
+mutation, which is how `test/e2e/phase1.sh` exercises it. The controller still
+rejects `spec.selector` outright: a user can create such a Service from scratch
+on any cluster, so the correctness argument must not rest on an API quirk.
 
 **Per-node IPAM produces duplicate addresses.** `host-local` allocates from its
 range independently on every node, so one NAD subnet shared across nodes hands
-the same address to Pods on different nodes. DNS is cluster-wide, so publishing
-both would put a node-local address into an answer any client can receive. The
-controller keeps one endpoint — chosen by `(IP, PodUID)` so the winner never
-flaps — and raises a `DuplicateAddress` Warning event naming the losers. Use
-per-node ranges or a cluster-wide IPAM to avoid the situation entirely.
+the same address to Pods on different nodes. Found in the Phase 1 E2E, not
+hypothesised.
+
+Every claimant is withdrawn, not all but one. Picking a winner is deterministic
+but it is not correct: DNS carries the address alone, so a client cannot be
+steered to the Pod the controller chose, `targetRef` plays no part in
+forwarding, and both Pods still own the address in the data plane whatever the
+slice says. Publishing neither, with a `DuplicateAddress` Warning event naming
+every claimant, is the only honest answer. Use per-node ranges or a
+cluster-wide IPAM to avoid the situation entirely.
 
 ## Status
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | 1 | network-status parser; Service → EndpointSlice; Pod lifecycle; `ready=false` pre-registration | **done**, 23/23 acceptance on a live cluster |
-| 2 | Node agent: netns mapping, netlink local health | next |
-| 3 | gRPC health protocol, controller health store | protocol drafted in `api/health.proto` |
+| 2 | Node agent: Pod UID → sandbox netns, netlink local health | **done**, 14/14 acceptance |
+| 3 | gRPC health transport, stale-report rejection | protocol fixed in `api/health.proto`; store and freshness already in place |
 | 4 | Endpoint-scope active path probe, hysteresis | |
-| 5 | Final readiness, all-endpoints-down guard | partly in `readiness.go` |
+| 5 | Final readiness, all-endpoints-down guard | `readiness.go` computes it; the guard is outstanding |
 | 6 | Node-scope shared path probe | last |
 
-Until an agent exists, no report is ever fresh, so every endpoint stays
-`ready=false`. That is the correct behaviour rather than a placeholder: an
-address nobody has checked must not be advertised.
+The agent now supplies local state; until a path probe exists no path report is
+ever fresh, so every endpoint stays `ready=false`. That is the correct behaviour
+rather than a placeholder: an address nobody has checked must not be advertised.
+
+### Two kinds of state, two streams
+
+Local state and path state are reported separately because they have different
+cardinality, and collapsing them would hide that:
+
+```
+local state   one per attachment, always
+
+path state    Endpoint scope -> one per attachment
+              Node scope     -> one per (node, NAD)
+
+    Pod A ─ local A ┐
+    Pod B ─ local B ├── shared Path(node1, NAD-X)
+    Pod C ─ local C ┘
+```
+
+A single message carrying both would force the agent to copy one Node-scope
+probe result into N per-Pod reports — the duplication the scope exists to
+remove — and give each copy its own hysteresis, reintroducing the transition
+skew that sharing is meant to eliminate. The controller joins the two on
+`attachment_id` and on the scope key, and `HealthStore` keeps one map per kind.
+
+Node scope therefore removes the *shared path probe and its hysteresis*, not the
+netns entry. Local observation stays per Pod under both scopes.
 
 ## Layout
 
 ```
-cmd/controller        controller entrypoint
-cmd/agent             node agent entrypoint (Phase 2)
-internal/multus       network-status parsing and NAD canonicalisation
-internal/model        Attachment, Report, attachment identity
-internal/controller   reconcile, EndpointSlice diff/apply, health store, readiness
-internal/obs          JSONL measurement event stream
-api/health.proto      agent → controller protocol
-deploy/               RBAC and Deployment
-test/fixtures         NADs, workload, Service, VXLAN lab helper
-test/e2e/phase1.sh    Phase 1 acceptance
+cmd/controller           controller entrypoint
+cmd/agent                node agent entrypoint
+internal/multus          network-status parsing and NAD canonicalisation
+internal/attach          the annotation contract, shared by controller and agent
+internal/model           Attachment identity, LocalHealth, PathHealth, path domains
+internal/controller      reconcile, EndpointSlice diff/apply, health store, readiness
+internal/agent           the per-node observation loop
+internal/agent/netns     Pod UID → sandbox netns (Resolver interface + CRI impl)
+internal/agent/local     netns-scoped netlink inspection and subscription
+internal/obs             JSONL measurement event stream
+api/health.proto         agent → controller protocol
+deploy/                  RBAC, Deployment, agent DaemonSet
+test/fixtures            NADs, workload, Service, VXLAN/dummy lab helper
+test/e2e/phase1.sh       Phase 1 acceptance (24 checks)
+test/e2e/phase2.sh       Phase 2 acceptance (14 checks)
+hack/measure-detection.sh  detection-latency measurement
 ```
 
 ## Running
 
 ```bash
-make test                  # unit tests
-make run                   # controller out of cluster, events to stdout
-make load NODES=10.10.10.171   # build image, import into every k3s node
-make deploy
-make e2e                   # Phase 1 acceptance against the running controller
+make test                       # unit tests
+make run                        # controller out of cluster, events to stdout
+make load NODES=10.10.10.171    # build both images, import into every k3s node
+make deploy                     # controller Deployment + agent DaemonSet
+make e2e                        # phase 1 and phase 2 acceptance
 ```
 
 `make load` imports straight into each node's containerd, so no registry is
-needed.
+needed. `test/e2e/phase2.sh` injects faults into Pod network namespaces, so it
+must run on a node with root and `crictl`.
 
 ## Measurement
 
@@ -178,9 +218,49 @@ two externally observed points:
 | DNS convergence | `slice_patched` | address gone from DNS (external `t4`) |
 | User-visible outage | `t0` | last failed request (external `t5`) |
 
-Bench numbers so far: control plane ≈ 0.23 s, DNS convergence ≈ 0.97 s at a
-1 s TTL (5 s is the CoreDNS default). Detection dominates everything else, which
-is why Phase 2–4 matter more than any optimisation on this side.
+Bench numbers so far, on the two-node k3s cluster:
+
+| Interval | Measured |
+| --- | --- |
+| Detection (link down → `failure_detected`) | 121–158 ms, median **129 ms** over 6 runs |
+| Control plane (slice patch → API watch event) | ≈ **0.23 s** |
+| DNS convergence (slice change → answer change) | ≈ **0.97 s** at a 1 s TTL, 5 s is the default |
+
+Detection is the term the design controls, and at netlink speed it is now the
+smallest of the three. What netlink cannot see at all — an underlay blackhole,
+which changes no local kernel state — is what Phase 4 adds the active probe for.
+Reproduce the first row with `hack/measure-detection.sh`.
+
+## Resolving a Pod to its network namespace
+
+```
+Pod UID -> CRI PodSandbox -> sandbox netns -> network-status.interface
+```
+
+No step involves an IP address. `PodUID -> IP -> netns` would be the obvious
+shortcut and it is unsafe: per-node IPAM means two Pods on two nodes can hold
+the same address, so the lookup is ambiguous exactly when it matters.
+
+`internal/agent/netns` keeps this behind a `Resolver` interface so the
+runtime-specific part stays one file deep. The CRI implementation lists
+sandboxes filtered by the `io.kubernetes.pod.uid` label, takes the newest ready
+one, and reads the network namespace path out of the verbose
+`PodSandboxStatus`, falling back to `/proc/<pid>/ns/net`. A cache in front of it
+drops an entry as soon as its namespace file disappears, which is what a sandbox
+recreate looks like from here.
+
+## Why the agent must enter the namespace
+
+macvlan and ipvlan move the child device wholly into the Pod netns, leaving
+nothing on the host for netlink to watch. Measured: through link-down,
+address-flush and underlay blackhole alike, a host-netns monitor stayed
+completely silent while the Pod-netns monitor saw the first two.
+
+Both link and address events are needed. Taking a link down emits only
+`RTM_NEWLINK` with the DOWN flag and **leaves the IPv4 address in place**, so an
+address-only subscription misses the fault entirely; flushing the address emits
+only `RTM_DELADDR`. `test/e2e/phase2.sh` asserts exactly this: during link-down
+the agent reports `address_present=true` alongside `link_usable=false`.
 
 ## Attachment identity
 
@@ -204,3 +284,13 @@ does not match.
 | `SliceLimit` | More than 1000 attachments for one family. |
 | `UnresolvedTargetPort` | A named `targetPort` cannot be resolved here; the Service port is published instead. |
 | `BadNetworkStatus` | A Pod's network-status annotation does not parse. |
+
+## Events emitted by the node agent
+
+| Event | Meaning |
+| --- | --- |
+| `agent_started` | Agent came up on a node. |
+| `attachment_observed` | First observation of an attachment, carrying the resolved netns path and sandbox id. |
+| `local_health` | One observation per attachment per resync, with all three checks reported individually. Also the report heartbeat that keeps the controller's freshness check satisfied. |
+| `failure_detected` / `recovery_detected` | Local readiness changed. These are the anchors detection latency is measured from. |
+| `attachment_retired` | The attachment is gone; a late report carrying its id can no longer be matched. |
