@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dnsprobe
+  namespace: ms-e2e
+spec:
+  containers:
+    - name: sh
+      image: docker.io/library/busybox:1.36
+      command: ["sh","-c","sleep infinity"]

@@ -1,0 +1,18 @@
+# Phase 2+ fixture: real macvlan semantics (parent/child isolation, per-netns
+# netlink). Requires test/fixtures/lab.sh up on every node first.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: sec-net-macvlan
+  namespace: ms-e2e
+spec:
+  config: '{
+    "cniVersion":"0.3.1",
+    "name":"sec-net-macvlan",
+    "plugins":[{
+      "type":"macvlan",
+      "master":"mslab0",
+      "mode":"bridge",
+      "ipam":{"type":"host-local","ranges":[[{"subnet":"10.100.60.0/24","rangeStart":"10.100.60.10","rangeEnd":"10.100.60.99"}]]}
+    }]
+  }'

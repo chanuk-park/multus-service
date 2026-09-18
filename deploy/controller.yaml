@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multus-service-controller
+  namespace: multus-service-system
+  labels: {app: multus-service-controller}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: multus-service-controller}
+  template:
+    metadata:
+      labels: {app: multus-service-controller}
+    spec:
+      serviceAccountName: multus-service-controller
+      containers:
+        - name: controller
+          image: boanlab/multus-service-controller:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect=true
+            - --health-ttl=15s
+            # JSONL measurement stream. Sent to stdout so it can be collected
+            # with `kubectl logs` during an evaluation run.
+            - --events-file=-
+            - --zap-log-level=info
+          ports:
+            - {name: metrics, containerPort: 8080}
+            - {name: probe, containerPort: 8081}
+          livenessProbe:
+            httpGet: {path: /healthz, port: probe}
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: probe}
+            initialDelaySeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule

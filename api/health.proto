@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package secondaryservice.v1;
+
+option go_package = "github.com/boanlab/multus-service/api/healthpb";
+
+// HealthReporter carries network observations from the node agents to the
+// controller. The agents measure; the controller decides. Nothing in this
+// protocol expresses a readiness verdict -- that is computed centrally, because
+// it also depends on Pod state the agent does not watch.
+service HealthReporter {
+  // Report streams observations. A stream keeps the per-report cost low and
+  // lets the controller notice a dead agent as a closed stream rather than
+  // waiting for reports to age out.
+  rpc Report(stream EndpointHealth) returns (stream ReportAck);
+}
+
+message EndpointHealth {
+  string pod_uid = 1;
+  string namespace = 2;
+  string pod_name = 3;
+
+  string nad = 4;             // canonical "ns/name"
+  string interface_name = 5;  // from network-status, never assumed to be net1
+  string ip = 6;
+
+  // local_ready is observed from inside the Pod netns: the interface exists,
+  // carries the expected address, and the link is usable. All three matter --
+  // taking a link down leaves the IPv4 address in place, so watching addresses
+  // alone reports a dead interface as healthy.
+  bool local_ready = 7;
+
+  // path_ready is the result of an active probe sourced from the Pod netns.
+  // netlink cannot supply it: an underlay blackhole changes no local state.
+  bool path_ready = 8;
+
+  int64 observed_at_unix_nano = 9;
+
+  // attachment_id is hash(pod_uid | nad | interface_name | ip).
+  //
+  // Without it, a report that was in flight while the sandbox was recreated
+  // would be applied to the new attachment, which has a different address on a
+  // different interface. The controller recomputes this value from the current
+  // network-status and drops any report that does not match.
+  string attachment_id = 10;
+
+  // node_name lets the controller attribute a report, and lets it tell a dead
+  // agent apart from a dead path when every attachment on one node goes quiet.
+  string node_name = 11;
+
+  // probe_scope records how path_ready was obtained: "endpoint" when the probe
+  // was sourced from this Pod's netns, "node" when it came from a shared
+  // per-(node, NAD) probe. The distinction has to survive into the data,
+  // because a node-scoped result rests on a topology assumption.
+  string probe_scope = 12;
+}
+
+message ReportAck {
+  string attachment_id = 1;
+  // accepted is false when the controller no longer recognises the attachment,
+  // which tells the agent to re-resolve the Pod rather than keep reporting.
+  bool accepted = 2;
+  string reason = 3;
+}

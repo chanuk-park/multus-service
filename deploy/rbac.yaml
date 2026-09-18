@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: multus-service-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: multus-service-controller
+  namespace: multus-service-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: multus-service-controller
+rules:
+  # Services carry the network / workload-selector annotations.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  # Pods carry the network-status annotation written by multus.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # The controller owns the slices it labels managed-by=secondary-service.boanlab.io.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Misconfiguration is reported on the Service, not just in the log.
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Read-only: used to validate that the referenced NAD exists.
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: multus-service-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: multus-service-controller
+subjects:
+  - kind: ServiceAccount
+    name: multus-service-controller
+    namespace: multus-service-system
+---
+# Leader election only; kept namespaced so the controller needs no cluster-wide
+# write access beyond EndpointSlices.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: multus-service-leader-election
+  namespace: multus-service-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: multus-service-leader-election
+  namespace: multus-service-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: multus-service-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: multus-service-controller
+    namespace: multus-service-system
