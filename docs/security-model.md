@@ -253,11 +253,13 @@ Same datapath, `--require-agent-auth` toggled. All values ms, median / p95:
 | failure->slice `t0->c3` | 127.3 / 136.8 | 129.7 / 144.2 | +2.45 |
 | failure->DNS `t0->t6` | 1669 / 4145 | 1656 / 4182 | -13.0 |
 
-Every delta is smaller than its own metric's run-to-run spread -- secure is even
-slightly faster on several -- so G2 adds **no measurable per-report cost** to the
-critical path. That is expected: authentication happens once at stream setup, not
-per report, so the steady-state datapath is byte-for-byte the node-string compare
-it always was. failure->DNS is dominated by the CoreDNS cache (5 s TTL) in both.
+Every delta is smaller than its own metric's run-to-run spread, so **no
+measurable incremental steady-state overhead from G2 was observed under this
+testbed workload** (a negative median delta means below the experimental noise,
+not a real speed-up). This is expected: authentication happens once at stream
+setup, not per report, so the steady-state datapath is the same node-string
+compare either way. DNS-withdrawal variance was dominated by CoreDNS caching
+under the default 5 s TTL in both arms.
 
 ### Steady-state resource use (secure, real 9-workload cluster)
 
@@ -271,12 +273,37 @@ difference from G2 unmeasurable against this baseline.
 
 ### RQ3 answer
 
-Producer-bound endpoint authorization costs one TokenReview (~3.5 ms) at each
-stream establishment and nothing measurable thereafter: the steady-state
-publication and withdrawal critical path is unchanged, and failure convergence
-is dominated by netlink detection (~130 ms) and the DNS cache (half the TTL), not
-by the security checks. The authority restoration that blocks the A1/A2 and
-G3 attacks is effectively free on the endpoint-management hot path.
+Producer-bound endpoint authorization costs one TokenReview (~3.5 ms median) at
+each stream establishment. No measurable incremental steady-state overhead was
+observed under this testbed workload: the publication and withdrawal critical
+path is unchanged, and failure convergence is dominated by netlink detection
+(~130 ms) and CoreDNS caching (default 5 s TTL), not by the security checks. The
+authority restoration that blocks the A1/A2 and G3 attacks imposes no
+steady-state cost we could measure on the endpoint-management path; its cost is
+confined to session establishment and to recovery after an agent is replaced
+(below).
+
+### Recovery after an agent is replaced (`hack/measure-reconnect-recovery.sh`, n=20)
+
+Deleting the agent Pod that hosts a ready endpoint exercises the full secure
+session lifecycle: `SessionManager` revoke -> old stream torn down -> new
+DaemonSet Pod + projected token -> TokenReview + AgentRegistry -> new stream ->
+`SnapshotBegin`..`SnapshotEnd` atomic commit -> endpoint ready restored.
+
+| Interval | median | p95 |
+| --- | --- | --- |
+| revoke -> authenticated stream | 1220 | 1716 ms |
+| authenticated stream -> snapshot commit | 988 | 995 ms |
+| **agent deletion -> endpoint ready** | **2715** | 2937 ms |
+
+User-visible recovery is ~2.7 s, and it is dominated by ordinary Kubernetes
+mechanics -- the kubelet recreating the DaemonSet Pod and the first refresh-driven
+snapshot (~1 s) -- not by the security handoff: the revoke + re-auth path is a
+small share, and the TokenReview inside it is the 3.5 ms already measured. So the
+security session lifecycle -- revoke a stale generation immediately, admit only
+the new one, resync atomically -- closes the availability side too: authority is
+handed off and readiness is restored within a few seconds, bounded by Pod
+recreation rather than by the checks.
 
 ## Result: G3 stale-generation / replay (`hack/attack-g3.sh`)
 
@@ -294,7 +321,9 @@ whether evidence from a superseded generation can take effect.
 R1 is the sharpest: because the id is bound to the Pod UID, a recreated Pod
 gets a new attachment generation, and the old id has no authority over it. The
 property is: **stale evidence cannot acquire authority over a new attachment
-generation, and cannot resurrect or hold an endpoint.**
+generation, and cannot resurrect or hold an endpoint** -- and, per the recovery
+measurement above, the new generation's authority is handed off and readiness
+restored within a few seconds of the old one being revoked.
 
 ## Status
 
@@ -308,5 +337,5 @@ generation, and cannot resurrect or hold an endpoint.**
   generation refused, endpoint ages out.
 - **RQ3 measured**: connection-time TokenReview ~3.5 ms median (node binding
   ~1 us), amortized to ~0 per report; G2 on-vs-off critical-path overhead within
-  noise (report->slice Δ -0.03 ms); steady-state controller ~6 m CPU / ~12-49 MB.
-  Producer authorization is effectively free on the hot path.
+  noise (report->slice Δ -0.03 ms, below experimental spread); steady-state
+  controller ~6 m CPU / ~12-49 MB. No measurable steady-state overhead from G2.

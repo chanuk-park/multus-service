@@ -210,6 +210,7 @@ test/tools/g3replay          the replay adversary used by attack-g3.sh
 hack/measure-auth-establishment.sh  connection-time auth cost (TokenReview/node binding)
 hack/measure-auth-frequency.sh      TokenReview frequency (O(stream) not O(report))
 hack/compare-convergence.py         G2 on-vs-off convergence Δ table
+hack/measure-reconnect-recovery.sh  security session lifecycle recovery latency
 hack/tokenreview-spike.sh    G2 feasibility: Pod-bound token → authoritative node
 hack/gen-certs.sh            issue the controller CA + server cert
 test/tools/spoof             the adversary used by attack-spoof.sh
