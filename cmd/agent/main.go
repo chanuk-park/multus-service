@@ -9,6 +9,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,6 +35,13 @@ var scheme = runtime.NewScheme()
 
 func init() { _ = clientgoscheme.AddToScheme(scheme) }
 
+func hostOf(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return addr[:i]
+	}
+	return addr
+}
+
 func main() {
 	var (
 		nodeName   string
@@ -43,6 +51,9 @@ func main() {
 		probeAddr  string
 		metricsAdr string
 		ctrlAddr   string
+		ctrlName   string
+		tokenPath  string
+		caPath     string
 		refresh    time.Duration
 		pathMode   string
 		probeEvery time.Duration
@@ -63,6 +74,12 @@ func main() {
 	flag.StringVar(&metricsAdr, "metrics-bind-address", "0", "metrics endpoint; 0 disables")
 	flag.StringVar(&ctrlAddr, "controller-address", os.Getenv("CONTROLLER_ADDRESS"),
 		"controller health transport, host:port; empty observes locally without reporting")
+	flag.StringVar(&ctrlName, "controller-server-name", os.Getenv("CONTROLLER_SERVER_NAME"),
+		"TLS server name to verify the controller certificate against")
+	flag.StringVar(&tokenPath, "token-path", "/var/run/secrets/multus-service/health-token",
+		"projected Pod-bound token presented to the controller as a bearer credential")
+	flag.StringVar(&caPath, "ca-path", "/etc/multus-service/ca/ca.crt",
+		"CA certificate for server-authenticated TLS to the controller")
 	flag.StringVar(&pathMode, "path-probe", agent.PathNone,
 		"path state source: none | icmp | assume-ready. "+
 			"assume-ready is a synthetic scaffold that reports every path up without probing")
@@ -154,12 +171,28 @@ func main() {
 
 	var sink agent.Sink = agent.NopSink{}
 	if ctrlAddr != "" {
+		// TLS and the bearer token are only wired when their files exist, so the
+		// same binary still runs plaintext in a bare test harness.
+		usableCA, usableTok := caPath, tokenPath
+		if _, err := os.Stat(caPath); err != nil {
+			usableCA = ""
+		}
+		if _, err := os.Stat(tokenPath); err != nil {
+			usableTok = ""
+		}
+		sn := ctrlName
+		if sn == "" {
+			sn = hostOf(ctrlAddr)
+		}
 		gs := &agent.GRPCSink{
 			Addr:       ctrlAddr,
 			NodeName:   nodeName,
 			InstanceID: instanceID,
 			Events:     events,
 			Refresh:    refresh,
+			TokenPath:  usableTok,
+			CAPath:     usableCA,
+			ServerName: sn,
 		}
 		if err := mgr.Add(gs); err != nil {
 			setupLog.Error(err, "registering health sink")

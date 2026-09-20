@@ -45,7 +45,7 @@ deploy:
 undeploy:
 	kubectl delete -f deploy/agent-daemonset.yaml -f deploy/controller.yaml -f deploy/rbac.yaml --ignore-not-found
 
-e2e: e2e-phase1 e2e-phase2 e2e-phase3 e2e-phase4
+e2e: e2e-phase1 e2e-phase2 e2e-phase3 e2e-phase4 e2e-phase5
 
 e2e-phase1:
 	./test/e2e/phase1.sh
@@ -61,3 +61,6 @@ e2e-phase3:
 
 e2e-phase4:
 	./test/e2e/phase4.sh
+
+e2e-phase5:
+	./test/e2e/phase5.sh

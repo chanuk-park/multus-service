@@ -21,6 +21,8 @@ spec:
             - --leader-elect=true
             - --health-ttl=5s
             - --health-bind-address=:9090
+            - --health-audience=health-controller
+            - --tls-dir=/etc/multus-service/tls
             # JSONL measurement stream. Sent to stdout so it can be collected
             # with `kubectl logs` during an evaluation run.
             - --events-file=-
@@ -42,6 +44,11 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tls, mountPath: /etc/multus-service/tls, readOnly: true}
+      volumes:
+        - name: tls
+          secret: {secretName: controller-tls}
       nodeSelector:
         node-role.kubernetes.io/control-plane: "true"
       tolerations:

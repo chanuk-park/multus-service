@@ -30,6 +30,11 @@ rules:
   - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # Authenticate agent-presented Pod-bound tokens. This is what lets the
+  # controller resolve a node-bound identity instead of trusting envelope.node.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
   # Read-only: used to validate that the referenced NAD exists.
   - apiGroups: ["k8s.cni.cncf.io"]
     resources: ["network-attachment-definitions"]

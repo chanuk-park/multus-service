@@ -26,6 +26,7 @@ type Registry struct {
 	attachments map[string]model.Attachment
 	attOwners   map[string][]types.NamespacedName
 	pathOwners  map[string][]types.NamespacedName
+	pathNodes   map[string]map[string]bool // path key -> set of nodes it covers
 }
 
 type serviceEntry struct {
@@ -40,6 +41,7 @@ func NewRegistry() *Registry {
 		attachments: map[string]model.Attachment{},
 		attOwners:   map[string][]types.NamespacedName{},
 		pathOwners:  map[string][]types.NamespacedName{},
+		pathNodes:   map[string]map[string]bool{},
 	}
 }
 
@@ -63,6 +65,7 @@ func (r *Registry) rebuildLocked() {
 	atts := make(map[string]model.Attachment)
 	attOwners := make(map[string][]types.NamespacedName)
 	pathOwners := make(map[string][]types.NamespacedName)
+	pathNodes := make(map[string]map[string]bool)
 
 	for key, e := range r.byService {
 		for _, a := range e.atts {
@@ -71,9 +74,13 @@ func (r *Registry) rebuildLocked() {
 			attOwners[id] = appendUnique(attOwners[id], key)
 			pk := a.PathKey(e.scope)
 			pathOwners[pk] = appendUnique(pathOwners[pk], key)
+			if pathNodes[pk] == nil {
+				pathNodes[pk] = map[string]bool{}
+			}
+			pathNodes[pk][a.NodeName] = true
 		}
 	}
-	r.attachments, r.attOwners, r.pathOwners = atts, attOwners, pathOwners
+	r.attachments, r.attOwners, r.pathOwners, r.pathNodes = atts, attOwners, pathOwners, pathNodes
 }
 
 func appendUnique(list []types.NamespacedName, key types.NamespacedName) []types.NamespacedName {
@@ -107,6 +114,19 @@ func (r *Registry) PathKey(key string) ([]types.NamespacedName, bool) {
 		return nil, false
 	}
 	return append([]types.NamespacedName(nil), owners...), true
+}
+
+// PathKeyOnNode reports whether the given node is the sole node behind a path
+// key -- i.e. whether that node is authorized to report path evidence for it.
+//
+// An Endpoint-scope key covers exactly one attachment, so exactly one node. A
+// Node-scope key is (node, NAD) by construction, so also one node. A key that
+// somehow spans nodes authorizes none of them, which is the safe answer.
+func (r *Registry) PathKeyOnNode(pathKey, node string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	nodes := r.pathNodes[pathKey]
+	return len(nodes) == 1 && nodes[node]
 }
 
 // Len reports how many distinct attachments and path keys are known.

@@ -141,7 +141,7 @@ become the substrate the security mechanisms build on, not the contribution.
 | 2 | Node agent: Pod UID → sandbox netns, netlink local health | **done**, 14/14 acceptance |
 | 3 | gRPC health transport, snapshots, stale-report rejection | **done**, 21/21 acceptance |
 | 4 | Endpoint-scope active path probe, hysteresis | **done**, 21/21 acceptance |
-| 5 | Final readiness, all-endpoints-down guard | `readiness.go` computes it; the guard is outstanding |
+| 5 | Security: G2 subject-bound authority (TokenReview, AgentRegistry, session revocation, TLS) | **done**, 8/8 acceptance; attack now blocked |
 | 6 | Node-scope shared path probe, `probe-scope` read from the NAD | last — the probe manager already keys on scope, so this is target construction, not new machinery |
 
 `--path-probe=icmp` probes the real secondary datapath. `--path-probe=none`
@@ -200,11 +200,13 @@ test/e2e/phase1.sh       Phase 1 acceptance (24 checks)
 test/e2e/phase2.sh       Phase 2 acceptance (14 checks)
 test/e2e/phase3.sh       Phase 3 acceptance (21 checks)
 test/e2e/phase4.sh       Phase 4 acceptance (21 checks)
+test/e2e/phase5.sh       Phase 5 security acceptance (G2, 8 checks)
 test/tools/healthreport  sends deliberately bad reports, for the rejection tests
 hack/measure-detection.sh    detection latency alone
 hack/measure-convergence.sh  full t0 → t6 decomposition
 hack/attack-spoof.sh         forged-report attack reproduction (A1/A2/G1)
 hack/tokenreview-spike.sh    G2 feasibility: Pod-bound token → authoritative node
+hack/gen-certs.sh            issue the controller CA + server cert
 test/tools/spoof             the adversary used by attack-spoof.sh
 docs/security-model.md       threat model, split-authority design, spike results
 ```

@@ -29,6 +29,14 @@ type GRPCSink struct {
 	InstanceID string
 	Events     *obs.Recorder
 
+	// TokenPath is the projected Pod-bound token presented as a bearer
+	// credential. Empty disables per-RPC auth (tests only).
+	TokenPath string
+	// CAPath is the controller CA for server-authenticated TLS. Empty means
+	// plaintext (tests only).
+	CAPath     string
+	ServerName string
+
 	// Refresh bounds how long the controller can go without hearing the full
 	// state, independent of whether anything changed. It must stay well under
 	// the controller's freshness TTL.
@@ -78,7 +86,21 @@ func (s *GRPCSink) Start(ctx context.Context) error {
 }
 
 func (s *GRPCSink) session(ctx context.Context, lg logger) error {
-	conn, err := grpc.NewClient(s.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var opts []grpc.DialOption
+	tc, err := transportCreds(s.CAPath, s.ServerName)
+	if err != nil {
+		return fmt.Errorf("client tls: %w", err)
+	}
+	if tc != nil {
+		opts = append(opts, grpc.WithTransportCredentials(tc))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	if s.TokenPath != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(tokenCreds{path: s.TokenPath, requireTLS: tc != nil}))
+	}
+
+	conn, err := grpc.NewClient(s.Addr, opts...)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", s.Addr, err)
 	}

@@ -6,9 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -36,6 +41,14 @@ type HealthServer struct {
 	Registry *Registry
 	Events   *obs.Recorder
 
+	// Auth turns the stream's bearer token into a node-bound identity. When nil,
+	// the transport is unauthenticated (used only by unit tests); production
+	// always sets it.
+	Auth Authenticator
+	// Sessions binds each stream to its agent Pod UID so the stream can be
+	// revoked when that agent is deregistered.
+	Sessions *SessionManager
+
 	// Notify enqueues a reconcile for a Service whose health input changed.
 	// Without it readiness would only move on the next Service or Pod event.
 	Notify func(types.NamespacedName)
@@ -46,15 +59,36 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 	ctx := stream.Context()
 	lg := log.FromContext(ctx).WithName("health")
 
+	// The node is decided here, once, from the authenticated identity -- never
+	// from anything the stream sends. envelope.node is demoted to a consistency
+	// check below.
+	agent, err := s.authenticate(ctx)
+	if err != nil {
+		s.Events.Emit("stream_rejected", "reason", err.Error())
+		return status.Error(codes.Unauthenticated, err.Error())
+	}
+	node := agent.NodeName
+
+	// Bind the stream to the agent Pod so deregistration can cancel it.
+	if s.Sessions != nil {
+		var release func()
+		ctx, release = s.Sessions.Register(ctx, agent.PodUID)
+		defer release()
+	}
+
+	s.Events.Emit("agent_authenticated",
+		"pod", agent.PodName, "namespace", agent.Namespace,
+		"service_account", agent.ServiceAccount, "node", node, "pod_uid", agent.PodUID)
+
 	var (
-		node, instance string
-		adopted        bool
-		inSnapshot     bool
-		epoch          uint64
-		bufLocal       []model.LocalHealth
-		bufPath        []model.PathHealth
-		since          int
-		lastSeq        uint64
+		instance   string
+		adopted    bool
+		inSnapshot bool
+		epoch      uint64
+		bufLocal   []model.LocalHealth
+		bufPath    []model.PathHealth
+		since      int
+		lastSeq    uint64
 	)
 
 	ack := func(resync bool, reason string) error {
@@ -66,32 +100,62 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 		})
 	}
 
-	for {
-		env, err := stream.Recv()
-		if err == io.EOF {
-			return nil
+	// A revoked session cancels ctx; turn that into a stream teardown.
+	recvErr := make(chan error, 1)
+	envs := make(chan *healthpb.HealthEnvelope)
+	go func() {
+		for {
+			env, err := stream.Recv()
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			select {
+			case envs <- env:
+			case <-ctx.Done():
+				return
+			}
 		}
-		if err != nil {
+	}()
+
+	for {
+		var env *healthpb.HealthEnvelope
+		select {
+		case <-ctx.Done():
+			s.Events.Emit("stream_revoked", "node", node, "pod_uid", agent.PodUID)
+			return status.Error(codes.Unauthenticated, "session revoked")
+		case err := <-recvErr:
+			if err == io.EOF {
+				return nil
+			}
 			return err
+		case env = <-envs:
 		}
 
 		if !adopted {
-			node, instance = env.NodeName, env.AgentInstanceId
-			if node == "" || instance == "" {
-				return fmt.Errorf("envelope must carry node_name and agent_instance_id")
+			instance = env.AgentInstanceId
+			if instance == "" {
+				return status.Error(codes.InvalidArgument, "envelope must carry agent_instance_id")
 			}
+			// The node is the authenticated one; the instance is the stream's
+			// own generation marker and may still come from the envelope.
 			prev := s.Store.AdoptInstance(node, instance)
 			adopted = true
 			s.Events.Emit("agent_connected",
 				"node", node, "agent_instance", instance, "superseded", prev)
 			lg.Info("agent connected", "node", node, "instance", instance, "superseded", prev)
-			// A fresh stream always starts from an unknown state, so ask for a
-			// snapshot rather than trusting whatever is already stored.
 			if err := ack(true, "new stream"); err != nil {
 				return err
 			}
 		}
-		if env.NodeName != node || env.AgentInstanceId != instance {
+		// envelope.node is not authorization input. A mismatch means a
+		// misconfigured or malicious sender; log it and carry on with the
+		// authenticated node.
+		if env.NodeName != "" && env.NodeName != node {
+			s.Events.Emit("envelope_node_mismatch",
+				"authenticated_node", node, "claimed_node", env.NodeName, "pod_uid", agent.PodUID)
+		}
+		if env.AgentInstanceId != instance {
 			s.reject(env, "instance changed mid-stream")
 			continue
 		}
@@ -233,6 +297,21 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 	}
 }
 
+// authenticate extracts the bearer token from the stream metadata and resolves
+// the node-bound identity. With no Authenticator set (unit tests only) it yields
+// a permissive identity so the transport can still be exercised in isolation.
+func (s *HealthServer) authenticate(ctx context.Context) (*AuthenticatedAgent, error) {
+	if s.Auth == nil {
+		return &AuthenticatedAgent{PodUID: "test", NodeName: ""}, nil
+	}
+	md, _ := metadata.FromIncomingContext(ctx)
+	var token string
+	if vs := md.Get("authorization"); len(vs) > 0 {
+		token = strings.TrimPrefix(vs[0], "Bearer ")
+	}
+	return s.Auth.Authenticate(ctx, token)
+}
+
 // localFrom validates a report against the registry and converts it.
 func (s *HealthServer) localFrom(node string, m *healthpb.LocalHealth) (model.LocalHealth, []types.NamespacedName, bool) {
 	att, owners, ok := s.Registry.Attachment(m.AttachmentId)
@@ -268,6 +347,14 @@ func (s *HealthServer) localFrom(node string, m *healthpb.LocalHealth) (model.Lo
 func (s *HealthServer) pathFrom(node string, m *healthpb.PathHealth) (model.PathHealth, []types.NamespacedName, bool) {
 	owners, ok := s.Registry.PathKey(m.ScopeId)
 	if !ok {
+		return model.PathHealth{}, nil, false
+	}
+	// Producer authority applies to path evidence too: the reporting node must
+	// own the domain it is reporting for. Under Endpoint scope the scope key is
+	// the attachment id, so the attachment's node must match; under Node scope
+	// the domain is (node, NAD), so the domain's node must match. Either way the
+	// node is the authenticated one, never the envelope's.
+	if !s.Registry.PathKeyOnNode(m.ScopeId, node) {
 		return model.PathHealth{}, nil, false
 	}
 	scope := model.ScopeEndpoint
@@ -331,6 +418,13 @@ func (s *HealthServer) notifyAll(locals []model.LocalHealth, paths []model.PathH
 type Serve struct {
 	Addr   string
 	Server *HealthServer
+
+	// TLSCert and TLSKey enable server-authenticated TLS. The bearer token that
+	// carries agent identity is only as safe as the channel: without TLS an
+	// attacker on the path could lift a valid token and replay it, and
+	// TokenReview would accept it. Empty means plaintext (tests only).
+	TLSCert string
+	TLSKey  string
 }
 
 // Start implements manager.Runnable.
@@ -339,13 +433,24 @@ func (g *Serve) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", g.Addr, err)
 	}
-	srv := grpc.NewServer()
+
+	var opts []grpc.ServerOption
+	secure := "plaintext"
+	if g.TLSCert != "" && g.TLSKey != "" {
+		creds, err := credentials.NewServerTLSFromFile(g.TLSCert, g.TLSKey)
+		if err != nil {
+			return fmt.Errorf("load server tls: %w", err)
+		}
+		opts = append(opts, grpc.Creds(creds))
+		secure = "tls"
+	}
+	srv := grpc.NewServer(opts...)
 	healthpb.RegisterHealthReporterServer(srv, g.Server)
 
 	go func() {
 		<-ctx.Done()
 		srv.GracefulStop()
 	}()
-	log.FromContext(ctx).Info("health transport listening", "addr", g.Addr)
+	log.FromContext(ctx).Info("health transport listening", "addr", g.Addr, "transport", secure)
 	return srv.Serve(ln)
 }

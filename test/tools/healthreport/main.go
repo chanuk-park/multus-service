@@ -19,10 +19,25 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	healthpb "github.com/boanlab/multus-service/api/healthpb"
 )
+
+type bearerCreds struct {
+	path string
+	tls  bool
+}
+
+func (b bearerCreds) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	t, err := os.ReadFile(b.path)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"authorization": "Bearer " + string(t)}, nil
+}
+func (b bearerCreds) RequireTransportSecurity() bool { return b.tls }
 
 func main() {
 	var (
@@ -35,6 +50,9 @@ func main() {
 		iface    = flag.String("interface", "", "interface name, for the out-of-order case")
 		ip       = flag.String("ip", "", "address, for the out-of-order case")
 		wait     = flag.Duration("wait", 3*time.Second, "how long to stay connected after sending")
+		caPath   = flag.String("ca", "", "controller CA for TLS; empty dials plaintext")
+		srvName  = flag.String("server-name", "", "TLS server name")
+		tokPath  = flag.String("token", "", "bearer token file")
 	)
 	flag.Parse()
 	if *node == "" || *mode == "" {
@@ -45,7 +63,20 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var opts []grpc.DialOption
+	if *caPath != "" {
+		tc, err := credentials.NewClientTLSFromFile(*caPath, *srvName)
+		if err != nil {
+			fail("client tls", err)
+		}
+		opts = append(opts, grpc.WithTransportCredentials(tc))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	if *tokPath != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(bearerCreds{path: *tokPath, tls: *caPath != ""}))
+	}
+	conn, err := grpc.NewClient(*addr, opts...)
 	if err != nil {
 		fail("dial", err)
 	}

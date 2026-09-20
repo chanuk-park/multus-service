@@ -71,7 +71,9 @@ HARNESS_LOG=$(mktemp)
 harness() {
   local inst=""
   for a in "$@"; do [ "$prev" = "--instance" ] && inst=$a; prev=$a; done
-  ( cd "$ROOT" && go run ./test/tools/healthreport --addr "$CTRL_ADDR" --node "$NODE" "$@" ) \
+  mint_agent_token
+  ( cd "$ROOT" && go run ./test/tools/healthreport --addr "$CTRL_ADDR" \
+      --ca "$P3_CA" --server-name "$SERVER_NAME" --token "$P3_TOK" --node "$NODE" "$@" ) \
     > "$HARNESS_LOG" 2>&1
   # Without confirming the connection, a port-forward that never came up is
   # indistinguishable from a rejection that never fired.
@@ -89,6 +91,7 @@ cleanup() {
     -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]' >/dev/null 2>&1
   kubectl delete ns "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
   "$FIXTURES/lab.sh" down >/dev/null 2>&1
+  rm -f /tmp/p3-ca.crt /tmp/p3-agent.tok
 }
 trap cleanup EXIT
 

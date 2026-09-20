@@ -587,7 +587,7 @@ func TestConflictWarningNamesEveryClaimant(t *testing.T) {
 		}
 	}
 	for _, pod := range []string{"amf-a", "amf-b", "amf-c"} {
-		if !containsStr(msg, pod) {
+		if !containsSub(msg, pod) {
 			t.Errorf("warning should name %s, got %q", pod, msg)
 		}
 	}
@@ -640,7 +640,7 @@ func addrsOf(s *discoveryv1.EndpointSlice) []string {
 	return out
 }
 
-func containsStr(s, sub string) bool {
+func containsSub(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
 			return true

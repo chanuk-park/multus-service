@@ -49,6 +49,8 @@ spec:
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
             - name: CONTROLLER_ADDRESS
               value: multus-service-controller.multus-service-system.svc:9090
+            - name: CONTROLLER_SERVER_NAME
+              value: multus-service-controller.multus-service-system.svc
           securityContext:
             # Entering another network namespace needs CAP_SYS_ADMIN, and both
             # the CRI socket (root:root 0660) and the namespace files under
@@ -60,6 +62,8 @@ spec:
           volumeMounts:
             - {name: cri, mountPath: /run/k3s/containerd/containerd.sock, readOnly: true}
             - {name: netns, mountPath: /var/run/netns, mountPropagation: HostToContainer}
+            - {name: health-token, mountPath: /var/run/secrets/multus-service, readOnly: true}
+            - {name: controller-ca, mountPath: /etc/multus-service/ca, readOnly: true}
           ports:
             - {name: probe, containerPort: 8081}
           livenessProbe:
@@ -69,6 +73,18 @@ spec:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {memory: 256Mi}
       volumes:
+        # A Pod-bound token with the controller's dedicated audience. Being
+        # Pod-bound, it stops authenticating the instant this Pod is deleted,
+        # which is half of what makes a retired agent's evidence stop counting.
+        - name: health-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: health-token
+                  audience: health-controller
+                  expirationSeconds: 600
+        - name: controller-ca
+          configMap: {name: controller-ca}
         # CRI is how a Pod UID becomes a sandbox netns. Nothing here goes via
         # an IP address: per-node IPAM makes addresses ambiguous across nodes.
         - name: cri
