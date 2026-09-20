@@ -123,6 +123,16 @@ slice says. Publishing neither, with a `DuplicateAddress` Warning event naming
 every claimant, is the only honest answer. Use per-node ranges or a
 cluster-wide IPAM to avoid the situation entirely.
 
+## Security direction
+
+The work is being reframed around **secondary endpoint publication integrity**:
+the publication path is a new authority chain outside Kubernetes' native
+control plane, and a forged health report can add or remove what a Service
+resolves to. See `docs/security-model.md`. Two attacks reproduce against the
+system as built (`hack/attack-spoof.sh`), and the Kubernetes-native defence is
+confirmed feasible (`hack/tokenreview-spike.sh`). The systems phases below
+become the substrate the security mechanisms build on, not the contribution.
+
 ## Status
 
 | Phase | Scope | State |
@@ -193,6 +203,10 @@ test/e2e/phase4.sh       Phase 4 acceptance (21 checks)
 test/tools/healthreport  sends deliberately bad reports, for the rejection tests
 hack/measure-detection.sh    detection latency alone
 hack/measure-convergence.sh  full t0 → t6 decomposition
+hack/attack-spoof.sh         forged-report attack reproduction (A1/A2/G1)
+hack/tokenreview-spike.sh    G2 feasibility: Pod-bound token → authoritative node
+test/tools/spoof             the adversary used by attack-spoof.sh
+docs/security-model.md       threat model, split-authority design, spike results
 ```
 
 ## Running
