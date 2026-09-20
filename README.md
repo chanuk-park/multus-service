@@ -207,6 +207,9 @@ hack/measure-convergence.sh  full t0 → t6 decomposition
 hack/attack-spoof.sh         forged-report attack reproduction (A1/A2/G1)
 hack/attack-g3.sh            stale-generation / replay attacks (R1/R2/R2'/R3)
 test/tools/g3replay          the replay adversary used by attack-g3.sh
+hack/measure-auth-establishment.sh  connection-time auth cost (TokenReview/node binding)
+hack/measure-auth-frequency.sh      TokenReview frequency (O(stream) not O(report))
+hack/compare-convergence.py         G2 on-vs-off convergence Δ table
 hack/tokenreview-spike.sh    G2 feasibility: Pod-bound token → authoritative node
 hack/gen-certs.sh            issue the controller CA + server cert
 test/tools/spoof             the adversary used by attack-spoof.sh

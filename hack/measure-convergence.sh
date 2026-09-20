@@ -53,9 +53,25 @@ kubectl create ns "$NS" >/dev/null
 cat <<EOP | kubectl apply -f - >/dev/null
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
-metadata: {name: sec-conv, namespace: $NS}
+metadata:
+  name: sec-conv
+  namespace: $NS
+  annotations: {secondary-service.boanlab.io/probe-scope: endpoint, secondary-service.boanlab.io/health-target: "10.214.0.200"}
 spec:
   config: '{"cniVersion":"0.3.1","name":"sec-conv","plugins":[{"type":"macvlan","master":"mslab0","mode":"bridge","ipam":{"type":"host-local","ranges":[[{"subnet":"10.214.0.0/24","rangeStart":"10.214.0.10","rangeEnd":"10.214.0.99"}]]}}]}'
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata: {name: sec-conv-target, namespace: $NS}
+spec:
+  config: '{"cniVersion":"0.3.1","name":"sec-conv-target","plugins":[{"type":"macvlan","master":"mslab0","mode":"bridge","ipam":{"type":"static","addresses":[{"address":"10.214.0.200/24"}]}}]}'
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: tgt, namespace: $NS, annotations: {k8s.v1.cni.cncf.io/networks: sec-conv-target}}
+spec:
+  nodeSelector: {kubernetes.io/hostname: $NODE}
+  containers: [{name: sh, image: docker.io/library/busybox:1.36, command: ["sh","-c","sleep infinity"]}]
 ---
 apiVersion: v1
 kind: Service
@@ -88,7 +104,7 @@ spec:
 EOP
 
 for _ in $(seq 1 180); do
-  [ "$(kubectl -n "$NS" get pod conv -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ] && break; sleep 1
+  [ "$(kubectl -n "$NS" get pod conv tgt --no-headers 2>/dev/null | grep -c Running)" = "2" ] && break; sleep 1
 done
 for _ in $(seq 1 180); do
   kubectl -n "$NS" exec dnsprobe -- sh -c 'command -v dig >/dev/null && command -v python3 >/dev/null' >/dev/null 2>&1 && break
@@ -148,7 +164,7 @@ while time.time() < end:
     if d > 0: time.sleep(d)
 PY
 
-ALOG=$(mktemp); CLOG=$(mktemp); DLOG=$(mktemp); RESULTS=$(mktemp)
+ALOG=$(mktemp); CLOG=$(mktemp); DLOG=$(mktemp); RESULTS=${RESULTS:-$(mktemp)}
 kubectl -n "$CTRL_NS" logs -f "$(agent_pod)" --tail=0 > "$ALOG" 2>/dev/null & ALOG_PID=$!
 kubectl -n "$CTRL_NS" logs -f deploy/multus-service-controller --tail=0 > "$CLOG" 2>/dev/null & CLOG_PID=$!
 RUNTIME=$(( N * 22 + 40 ))

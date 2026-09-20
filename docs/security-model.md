@@ -239,6 +239,45 @@ regardless of report volume: authentication is O(stream establishment), not
 O(report). The session cap exists only to bound how stale a rotated bearer token
 can be (the token is presented once per streaming RPC, not per message).
 
+### Critical-path overhead: G2 on vs off (`hack/measure-convergence.sh`, n≈30 each)
+
+Same datapath, `--require-agent-auth` toggled. All values ms, median / p95:
+
+| Interval | Unprotected (G2 off) | Secure (G2 on) | Δ median |
+| --- | --- | --- | --- |
+| agent detect `t0->a1` | 127.3 / 135.2 | 126.7 / 141.4 | -0.55 |
+| transport `a2->c1` | 0.62 / 1.24 | 0.63 / 2.63 | +0.01 |
+| recv->apply `c1->c2` | 0.08 / 0.39 | 0.08 / 0.45 | +0.00 |
+| apply->patch `c2->c3` | 0.81 / 1.29 | 0.72 / 1.14 | -0.09 |
+| **report->slice `c1->c3`** | 0.90 / 1.68 | **0.86 / 1.62** | **-0.03** |
+| failure->slice `t0->c3` | 127.3 / 136.8 | 129.7 / 144.2 | +2.45 |
+| failure->DNS `t0->t6` | 1669 / 4145 | 1656 / 4182 | -13.0 |
+
+Every delta is smaller than its own metric's run-to-run spread -- secure is even
+slightly faster on several -- so G2 adds **no measurable per-report cost** to the
+critical path. That is expected: authentication happens once at stream setup, not
+per report, so the steady-state datapath is byte-for-byte the node-string compare
+it always was. failure->DNS is dominated by the CoreDNS cache (5 s TTL) in both.
+
+### Steady-state resource use (secure, real 9-workload cluster)
+
+| | CPU | Memory (working set / RSS) |
+| --- | --- | --- |
+| controller | ~6 m | 12 Mi / ~49 MB |
+| agent (per node) | 3-7 m | 14-17 Mi / ~50 MB |
+
+The TokenReview frequency (2 per 330 s, from the session cap) makes the CPU
+difference from G2 unmeasurable against this baseline.
+
+### RQ3 answer
+
+Producer-bound endpoint authorization costs one TokenReview (~3.5 ms) at each
+stream establishment and nothing measurable thereafter: the steady-state
+publication and withdrawal critical path is unchanged, and failure convergence
+is dominated by netlink detection (~130 ms) and the DNS cache (half the TTL), not
+by the security checks. The authority restoration that blocks the A1/A2 and
+G3 attacks is effectively free on the endpoint-management hot path.
+
 ## Result: G3 stale-generation / replay (`hack/attack-g3.sh`)
 
 Each attacker authenticates as a *legitimate* node agent (a valid Pod-bound
@@ -267,7 +306,7 @@ generation, and cannot resurrect or hold an endpoint.**
 - **G3 reproduced and verified**: `hack/attack-g3.sh` (R1 attachment replay,
   R2 sequence rollback, R2' stale instance, R3 lease expiry) -- each stale
   generation refused, endpoint ages out.
-- **RQ3 in progress**: connection-time cost measured (TokenReview ~3.5 ms
-  median, node binding ~1 us, amortized to ~0 per report). Remaining:
-  failure->slice convergence with G2 on vs off, reconnect recovery, and
-  steady-state CPU/RSS.
+- **RQ3 measured**: connection-time TokenReview ~3.5 ms median (node binding
+  ~1 us), amortized to ~0 per report; G2 on-vs-off critical-path overhead within
+  noise (report->slice Δ -0.03 ms); steady-state controller ~6 m CPU / ~12-49 MB.
+  Producer authorization is effectively free on the hot path.
