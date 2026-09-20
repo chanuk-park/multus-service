@@ -61,10 +61,23 @@ for e in json.load(sys.stdin):
 # forward that is about to die looks identical to one that is up -- and a dead
 # forward reads as a rejection that never fired.
 CTRL_ADDR=""
+SERVER_NAME="$CTRL.$CTRL_NS.svc"
+P3_CA=/tmp/p3-ca.crt
+P3_TOK=/tmp/p3-agent.tok
 resolve_ctrl() {
   CTRL_ADDR="$(kubectl -n "$CTRL_NS" get svc "$CTRL" -o jsonpath='{.spec.clusterIP}' 2>/dev/null):9090"
+  kubectl -n "$CTRL_NS" get configmap controller-ca -o jsonpath='{.data.ca\.crt}' > "$P3_CA" 2>/dev/null || true
   retry 60 'bash -c "exec 3<>/dev/tcp/'"${CTRL_ADDR%:*}"'/9090" 2>/dev/null' \
     || { bad "controller health transport unreachable at $CTRL_ADDR"; return 1; }
+}
+# A valid Pod-bound token for the real agent on $NODE, so the harness
+# authenticates and then still exercises the app-layer rejection checks with an
+# authenticated-but-misbehaving identity.
+mint_agent_token() {
+  local pod uid
+  pod=$(kubectl -n "$CTRL_NS" get pod -l app="$AGENT_DS" --field-selector spec.nodeName="$NODE" -o jsonpath='{.items[0].metadata.name}')
+  uid=$(kubectl -n "$CTRL_NS" get pod "$pod" -o jsonpath='{.metadata.uid}')
+  kubectl -n "$CTRL_NS" create token "$AGENT_DS" --bound-object-kind Pod --bound-object-name "$pod" --bound-object-uid "$uid" --audience health-controller --duration 1h > "$P3_TOK" 2>/dev/null
 }
 
 HARNESS_LOG=$(mktemp)
