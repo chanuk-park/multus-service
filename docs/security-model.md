@@ -206,6 +206,24 @@ audience:
 Rejection reason: `authenticated workload is not a registered node agent`. A
 valid token is not authority to report health — only a registered agent's is.
 
+## Result: G3 stale-generation / replay (`hack/attack-g3.sh`)
+
+Each attacker authenticates as a *legitimate* node agent (a valid Pod-bound
+token), so producer authorization (G2) has already passed. What is under test is
+whether evidence from a superseded generation can take effect.
+
+| # | Attack | Mechanism that blocks it | Result |
+| --- | --- | --- | --- |
+| R1 | replay a deleted Pod's old `attachment_id` after recreate | `attachment_id = hash(PodUID\|NAD\|iface\|IP)` + Registry membership | old id refused as unknown; 0 applied |
+| R2 | roll a sequence backwards within one instance | per-instance monotonic sequence | rejected: sequence did not advance |
+| R2' | a superseded agent instance keeps sending | instance adoption + `ErrStaleInstance` | rejected: superseded agent instance |
+| R3 | hold an endpoint alive with stale keep-alive after the agent is parked | receive-time lease (`accepted_at` + TTL) | endpoint ages out to not-ready |
+
+R1 is the sharpest: because the id is bound to the Pod UID, a recreated Pod
+gets a new attachment generation, and the old id has no authority over it. The
+property is: **stale evidence cannot acquire authority over a new attachment
+generation, and cannot resurrect or hold an endpoint.**
+
 ## Status
 
 - A1 / A2 / G1 reproduced against the system as built — motivation secured.
@@ -213,6 +231,9 @@ valid token is not authority to report health — only a registered agent's is.
   `test/e2e/phase5.sh` (8/8: no-token, wrong-audience, valid-non-agent,
   cross-node, session revocation, re-adopt), and `hack/attack-spoof.sh` (A1/A2
   now blocked, 0 unauthorized accepted).
-- **Next:** flesh out the taxonomy with independent reproductions of the replay
-  and stale-generation rows (G3 is already enforced; the experiments make it
-  legible), and the cost measurements (auth/reconnect/CPU overhead).
+- **G3 reproduced and verified**: `hack/attack-g3.sh` (R1 attachment replay,
+  R2 sequence rollback, R2' stale instance, R3 lease expiry) -- each stale
+  generation refused, endpoint ages out.
+- **Next:** cost measurement (security on/off): TokenReview / registration /
+  reconnect latency at connection time, and steady-state health-update latency,
+  controller CPU/RSS, and end-to-end convergence overhead.

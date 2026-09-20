@@ -141,7 +141,7 @@ become the substrate the security mechanisms build on, not the contribution.
 | 2 | Node agent: Pod UID → sandbox netns, netlink local health | **done**, 14/14 acceptance |
 | 3 | gRPC health transport, snapshots, stale-report rejection | **done**, 21/21 acceptance |
 | 4 | Endpoint-scope active path probe, hysteresis | **done**, 21/21 acceptance |
-| 5 | Security: G2 subject-bound authority (TokenReview, AgentRegistry, session revocation, TLS) | **done**, 8/8 acceptance; attack now blocked |
+| 5 | Security: G2 subject-bound authority (TokenReview, AgentRegistry, session revocation, TLS); G3 stale-generation | **done**; G2 8/8 acceptance, G1/A1/A2 and G3 attacks reproduced and blocked |
 | 6 | Node-scope shared path probe, `probe-scope` read from the NAD | last — the probe manager already keys on scope, so this is target construction, not new machinery |
 
 `--path-probe=icmp` probes the real secondary datapath. `--path-probe=none`
@@ -205,6 +205,8 @@ test/tools/healthreport  sends deliberately bad reports, for the rejection tests
 hack/measure-detection.sh    detection latency alone
 hack/measure-convergence.sh  full t0 → t6 decomposition
 hack/attack-spoof.sh         forged-report attack reproduction (A1/A2/G1)
+hack/attack-g3.sh            stale-generation / replay attacks (R1/R2/R2'/R3)
+test/tools/g3replay          the replay adversary used by attack-g3.sh
 hack/tokenreview-spike.sh    G2 feasibility: Pod-bound token → authoritative node
 hack/gen-certs.sh            issue the controller CA + server cert
 test/tools/spoof             the adversary used by attack-spoof.sh
