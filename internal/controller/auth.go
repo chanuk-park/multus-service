@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"time"
+
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -35,9 +37,17 @@ type AuthenticatedAgent struct {
 	NodeName       string
 }
 
+// AuthTiming breaks down where establishment time goes, so a reviewer asking
+// "isn't the Kubernetes API round trip expensive?" can be answered directly.
+type AuthTiming struct {
+	TokenReview time.Duration
+	PodLookup   time.Duration
+	Total       time.Duration
+}
+
 // Authenticator turns a bearer token into a node-bound agent identity.
 type Authenticator interface {
-	Authenticate(ctx context.Context, token string) (*AuthenticatedAgent, error)
+	Authenticate(ctx context.Context, token string) (*AuthenticatedAgent, AuthTiming, error)
 }
 
 var (
@@ -66,31 +76,36 @@ type K8sAuthenticator struct {
 }
 
 // Authenticate validates the token and binds it to a node.
-func (a *K8sAuthenticator) Authenticate(ctx context.Context, token string) (*AuthenticatedAgent, error) {
+func (a *K8sAuthenticator) Authenticate(ctx context.Context, token string) (agent *AuthenticatedAgent, t AuthTiming, err error) {
+	start := time.Now()
+	defer func() { t.Total = time.Since(start) }()
+
 	if token == "" {
-		return nil, fmt.Errorf("%w: no bearer token", ErrUnauthenticated)
+		return nil, t, fmt.Errorf("%w: no bearer token", ErrUnauthenticated)
 	}
 
 	tr := &authv1.TokenReview{
 		Spec: authv1.TokenReviewSpec{Token: token, Audiences: []string{a.Audience}},
 	}
+	trStart := time.Now()
 	res, err := a.Client.AuthenticationV1().TokenReviews().Create(ctx, tr, metav1.CreateOptions{})
+	t.TokenReview = time.Since(trStart)
 	if err != nil {
-		return nil, fmt.Errorf("tokenreview: %w", err)
+		return nil, t, fmt.Errorf("tokenreview: %w", err)
 	}
 	if !res.Status.Authenticated {
-		return nil, fmt.Errorf("%w: %s", ErrUnauthenticated, res.Status.Error)
+		return nil, t, fmt.Errorf("%w: %s", ErrUnauthenticated, res.Status.Error)
 	}
 	// The apiserver returns the intersection of requested and token audiences;
 	// an empty intersection means the token was minted for something else.
 	if !containsStr(res.Status.Audiences, a.Audience) {
-		return nil, fmt.Errorf("%w: audience %q not honored", ErrUnauthenticated, a.Audience)
+		return nil, t, fmt.Errorf("%w: audience %q not honored", ErrUnauthenticated, a.Audience)
 	}
 
 	extra := res.Status.User.Extra
 	podUID := firstExtra(extra, extraPodUID)
 	if podUID == "" {
-		return nil, fmt.Errorf("%w: not a Pod-bound token", ErrUnauthenticated)
+		return nil, t, fmt.Errorf("%w: not a Pod-bound token", ErrUnauthenticated)
 	}
 	// res.Status.User.Username is system:serviceaccount:<ns>:<name>; the
 	// AgentRegistry carries the authoritative ServiceAccount, so it is used for
@@ -99,15 +114,17 @@ func (a *K8sAuthenticator) Authenticate(ctx context.Context, token string) (*Aut
 	// The token proves the Pod exists and its UID matches. The AgentRegistry
 	// proves that Pod is one of our agents and supplies the authoritative node,
 	// which is Pod.spec.nodeName keyed by the validated UID.
+	plStart := time.Now()
 	info, ok := a.Agents.ByUID(podUID)
+	t.PodLookup = time.Since(plStart)
 	if !ok {
-		return nil, fmt.Errorf("%w: pod-uid %s", ErrNotAnAgent, podUID)
+		return nil, t, fmt.Errorf("%w: pod-uid %s", ErrNotAnAgent, podUID)
 	}
 	if a.ExpectNamespace != "" && info.Namespace != a.ExpectNamespace {
-		return nil, fmt.Errorf("%w: namespace %s", ErrNotAnAgent, info.Namespace)
+		return nil, t, fmt.Errorf("%w: namespace %s", ErrNotAnAgent, info.Namespace)
 	}
 	if a.ExpectServiceAccount != "" && info.ServiceAccount != a.ExpectServiceAccount {
-		return nil, fmt.Errorf("%w: service account %s", ErrNotAnAgent, info.ServiceAccount)
+		return nil, t, fmt.Errorf("%w: service account %s", ErrNotAnAgent, info.ServiceAccount)
 	}
 
 	return &AuthenticatedAgent{
@@ -116,7 +133,7 @@ func (a *K8sAuthenticator) Authenticate(ctx context.Context, token string) (*Aut
 		Namespace:      info.Namespace,
 		ServiceAccount: info.ServiceAccount,
 		NodeName:       info.NodeName,
-	}, nil
+	}, t, nil
 }
 
 func firstExtra(extra map[string]authv1.ExtraValue, key string) string {

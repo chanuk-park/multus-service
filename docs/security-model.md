@@ -206,6 +206,39 @@ audience:
 Rejection reason: `authenticated workload is not a registered node agent`. A
 valid token is not authority to report health — only a registered agent's is.
 
+## RQ3: cost of producer-bound authorization
+
+The primary comparison toggles **G2 only**. G1 (Registry) and G3 (attachment /
+instance / sequence / lease) are membership and generation checks the baseline
+implementation needs anyway, and TLS is held on for both, so the incremental
+cost measured is exactly producer authentication/authorization:
+
+- **Unprotected baseline** (`--require-agent-auth=false`): TLS on, Registry on,
+  instance/sequence/lease on; TokenReview + AgentRegistry + node binding
+  bypassed; the node is the self-asserted envelope value (pre-G2 semantics).
+- **Secure**: the same datapath plus TokenReview, AgentRegistry, and
+  `pod-uid -> Pod.spec.nodeName` binding.
+
+### Connection-time cost (`hack/measure-auth-establishment.sh`, n=100)
+
+| Stage | min | median | p95 | max |
+| --- | --- | --- | --- | --- |
+| TokenReview (Kubernetes API round trip) | 1.73 | **3.46** | 4.71 | 17.6 ms |
+| Pod / AgentRegistry lookup (in-memory) | 0.000 | **0.001** | 0.002 | 0.04 ms |
+| Total authentication | 1.74 | **3.46** | 4.73 | 17.6 ms |
+
+The whole cost is the one TokenReview round trip; the node-binding lookup is a
+map read (~1 microsecond). This is paid once per stream, not per report.
+
+### Authentication is amortized (`hack/measure-auth-frequency.sh`)
+
+Steady state, 330 s, no injected load: **2 TokenReviews** (both from the 300 s
+`--max-session` cap forcing a reconnect), against 248 full-state applications.
+Without the session cap, an established stream performs **zero** TokenReviews
+regardless of report volume: authentication is O(stream establishment), not
+O(report). The session cap exists only to bound how stale a rotated bearer token
+can be (the token is presented once per streaming RPC, not per message).
+
 ## Result: G3 stale-generation / replay (`hack/attack-g3.sh`)
 
 Each attacker authenticates as a *legitimate* node agent (a valid Pod-bound
@@ -234,6 +267,7 @@ generation, and cannot resurrect or hold an endpoint.**
 - **G3 reproduced and verified**: `hack/attack-g3.sh` (R1 attachment replay,
   R2 sequence rollback, R2' stale instance, R3 lease expiry) -- each stale
   generation refused, endpoint ages out.
-- **Next:** cost measurement (security on/off): TokenReview / registration /
-  reconnect latency at connection time, and steady-state health-update latency,
-  controller CPU/RSS, and end-to-end convergence overhead.
+- **RQ3 in progress**: connection-time cost measured (TokenReview ~3.5 ms
+  median, node binding ~1 us, amortized to ~0 per report). Remaining:
+  failure->slice convergence with G2 on vs off, reconnect recovery, and
+  steady-state CPU/RSS.

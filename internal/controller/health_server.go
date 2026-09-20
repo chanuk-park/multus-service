@@ -41,10 +41,15 @@ type HealthServer struct {
 	Registry *Registry
 	Events   *obs.Recorder
 
-	// Auth turns the stream's bearer token into a node-bound identity. When nil,
-	// the transport is unauthenticated (used only by unit tests); production
-	// always sets it.
+	// Auth turns the stream's bearer token into a node-bound identity.
 	Auth Authenticator
+
+	// RequireAuth gates producer authentication/authorization (G2). When false,
+	// the transport keeps TLS, the Registry (G1), and instance/sequence/lease
+	// (G3), but the node is taken from the self-asserted envelope -- the pre-G2
+	// semantics. This exists solely so the RQ3 cost comparison toggles G2 alone,
+	// leaving the rest of the datapath identical.
+	RequireAuth bool
 	// Sessions binds each stream to its agent Pod UID so the stream can be
 	// revoked when that agent is deregistered.
 	Sessions *SessionManager
@@ -62,23 +67,29 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 	// The node is decided here, once, from the authenticated identity -- never
 	// from anything the stream sends. envelope.node is demoted to a consistency
 	// check below.
-	agent, err := s.authenticate(ctx)
+	agent, timing, err := s.authenticate(ctx)
 	if err != nil {
 		s.Events.Emit("stream_rejected", "reason", err.Error())
 		return status.Error(codes.Unauthenticated, err.Error())
 	}
-	node := agent.NodeName
 
-	// Bind the stream to the agent Pod so deregistration can cancel it.
-	if s.Sessions != nil {
-		var release func()
-		ctx, release = s.Sessions.Register(ctx, agent.PodUID)
-		defer release()
+	// node is the authenticated node when producer authentication is on, and the
+	// self-asserted envelope node (set on the first message) when it is off.
+	var node string
+	if agent != nil {
+		node = agent.NodeName
+		if s.Sessions != nil {
+			var release func()
+			ctx, release = s.Sessions.Register(ctx, agent.PodUID)
+			defer release()
+		}
+		s.Events.Emit("agent_authenticated",
+			"pod", agent.PodName, "namespace", agent.Namespace,
+			"service_account", agent.ServiceAccount, "node", node, "pod_uid", agent.PodUID,
+			"tokenreview_us", timing.TokenReview.Microseconds(),
+			"pod_lookup_us", timing.PodLookup.Microseconds(),
+			"auth_total_us", timing.Total.Microseconds())
 	}
-
-	s.Events.Emit("agent_authenticated",
-		"pod", agent.PodName, "namespace", agent.Namespace,
-		"service_account", agent.ServiceAccount, "node", node, "pod_uid", agent.PodUID)
 
 	var (
 		instance   string
@@ -137,8 +148,14 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 			if instance == "" {
 				return status.Error(codes.InvalidArgument, "envelope must carry agent_instance_id")
 			}
-			// The node is the authenticated one; the instance is the stream's
-			// own generation marker and may still come from the envelope.
+			if agent == nil {
+				// Producer authentication off: the node is self-asserted.
+				if env.NodeName == "" {
+					return status.Error(codes.InvalidArgument, "envelope must carry node_name")
+				}
+				node = env.NodeName
+			}
+			// The instance is the stream's own generation marker.
 			prev := s.Store.AdoptInstance(node, instance)
 			adopted = true
 			s.Events.Emit("agent_connected",
@@ -148,10 +165,10 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 				return err
 			}
 		}
-		// envelope.node is not authorization input. A mismatch means a
-		// misconfigured or malicious sender; log it and carry on with the
-		// authenticated node.
-		if env.NodeName != "" && env.NodeName != node {
+		// When authenticated, envelope.node is not authorization input; a
+		// mismatch is a misconfigured or malicious sender. When not, node IS
+		// the envelope's, so there is nothing to compare.
+		if agent != nil && env.NodeName != "" && env.NodeName != node {
 			s.Events.Emit("envelope_node_mismatch",
 				"authenticated_node", node, "claimed_node", env.NodeName, "pod_uid", agent.PodUID)
 		}
@@ -297,12 +314,14 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 	}
 }
 
-// authenticate extracts the bearer token from the stream metadata and resolves
-// the node-bound identity. With no Authenticator set (unit tests only) it yields
-// a permissive identity so the transport can still be exercised in isolation.
-func (s *HealthServer) authenticate(ctx context.Context) (*AuthenticatedAgent, error) {
-	if s.Auth == nil {
-		return &AuthenticatedAgent{PodUID: "test", NodeName: ""}, nil
+// authenticate extracts the bearer token and resolves the node-bound identity.
+//
+// A nil returned identity means "no authenticated node" -- either producer
+// authentication is disabled (RequireAuth false) or no Authenticator is set
+// (unit tests). The caller then falls back to the self-asserted envelope node.
+func (s *HealthServer) authenticate(ctx context.Context) (*AuthenticatedAgent, AuthTiming, error) {
+	if !s.RequireAuth || s.Auth == nil {
+		return nil, AuthTiming{}, nil
 	}
 	md, _ := metadata.FromIncomingContext(ctx)
 	var token string

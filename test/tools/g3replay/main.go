@@ -116,6 +116,18 @@ func main() {
 	}
 
 	switch *mode {
+	case "connect":
+		// Minimal: establish an authenticated stream, send one report, read one
+		// ack, exit. Used to measure connection-time auth cost without the
+		// per-case deadline wait.
+		s, done, err := dial()
+		if err != nil {
+			fail(err)
+		}
+		defer done()
+		_ = s.Send(env("g3-connect", 1, local()))
+		acks("CONNECT", s, 1)
+
 	case "replay-attachment":
 		s, done, err := dial()
 		if err != nil {

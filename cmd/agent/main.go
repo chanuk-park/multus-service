@@ -55,6 +55,7 @@ func main() {
 		tokenPath  string
 		caPath     string
 		refresh    time.Duration
+		maxSession time.Duration
 		pathMode   string
 		probeEvery time.Duration
 		probeWait  time.Duration
@@ -97,6 +98,9 @@ func main() {
 	flag.BoolVar(&evalMode, "evaluation-mode", false,
 		"refuse to start with a synthetic path source, so measurement runs cannot "+
 			"silently report numbers the system never measured")
+	flag.DurationVar(&maxSession, "max-session", 300*time.Second,
+		"cap a health stream's lifetime, then reconnect to re-read the projected token; "+
+			"keep below the token lifetime so a rotated credential is picked up. 0 disables")
 	flag.DurationVar(&refresh, "refresh", 1*time.Second,
 		"how often the full state is resent regardless of change; must stay well under the controller's health TTL")
 
@@ -190,6 +194,7 @@ func main() {
 			InstanceID: instanceID,
 			Events:     events,
 			Refresh:    refresh,
+			MaxSession: maxSession,
 			TokenPath:  usableTok,
 			CAPath:     usableCA,
 			ServerName: sn,

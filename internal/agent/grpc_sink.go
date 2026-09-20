@@ -42,6 +42,13 @@ type GRPCSink struct {
 	// the controller's freshness TTL.
 	Refresh time.Duration
 
+	// MaxSession caps a stream's lifetime, then closes it so the next connect
+	// re-reads the projected token. Because the token is presented once per RPC
+	// (Sync is one long-lived stream), an in-place rotation is only picked up on
+	// reconnect; capping the session below the token lifetime bounds how stale
+	// the presented credential can be. Zero disables the cap.
+	MaxSession time.Duration
+
 	mu           sync.Mutex
 	stream       healthpb.HealthReporter_SyncClient
 	needSnapshot bool
@@ -108,6 +115,13 @@ func (s *GRPCSink) session(ctx context.Context, lg logger) error {
 
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Cap the session so a rotated token is re-read on the next connect.
+	if s.MaxSession > 0 {
+		var capCancel context.CancelFunc
+		sctx, capCancel = context.WithTimeout(sctx, s.MaxSession)
+		defer capCancel()
+	}
 
 	stream, err := healthpb.NewHealthReporterClient(conn).Sync(sctx)
 	if err != nil {

@@ -47,6 +47,7 @@ func main() {
 		agentSA     string
 		agentLabel  string
 		tlsDir      string
+		requireAuth bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "liveness/readiness endpoint")
@@ -71,6 +72,10 @@ func main() {
 	flag.StringVar(&tlsDir, "tls-dir", "/etc/multus-service/tls",
 		"directory holding tls.crt and tls.key for the health transport; "+
 			"empty serves plaintext (never in production)")
+	flag.BoolVar(&requireAuth, "require-agent-auth", true,
+		"require producer authentication/authorization (G2): TokenReview + AgentRegistry + "+
+			"node binding. false keeps TLS, the Registry (G1) and instance/sequence/lease (G3) "+
+			"but trusts the self-asserted envelope node -- for the RQ3 cost comparison only")
 
 	zapOpts := zap.Options{Development: true}
 	zapOpts.BindFlags(flag.CommandLine)
@@ -168,12 +173,13 @@ func main() {
 		TLSCert: tlsCert,
 		TLSKey:  tlsKey,
 		Server: &controller.HealthServer{
-			Store:    health,
-			Registry: registry,
-			Events:   events,
-			Auth:     authn,
-			Sessions: sessions,
-			Notify:   r.Enqueue,
+			Store:       health,
+			Registry:    registry,
+			Events:      events,
+			Auth:        authn,
+			Sessions:    sessions,
+			RequireAuth: requireAuth,
+			Notify:      r.Enqueue,
 		},
 	}); err != nil {
 		setupLog.Error(err, "registering health transport")
@@ -202,7 +208,7 @@ func main() {
 
 	events.Emit("controller_started",
 		"health_ttl_ms", healthTTL.Milliseconds(), "health_addr", healthAddr,
-		"health_audience", healthAud, "tls", tlsCert != "")
+		"health_audience", healthAud, "tls", tlsCert != "", "require_agent_auth", requireAuth)
 	setupLog.Info("starting controller", "healthTTL", healthTTL, "healthAddr", healthAddr)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "manager exited")
