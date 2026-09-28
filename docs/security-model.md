@@ -282,7 +282,7 @@ re-measured. The conclusion is unchanged; the absolute detection and DNS numbers
 differ from the first run (detection ~40 ms vs ~127 ms, DNS median ~2.3 s vs
 ~1.7 s) and are reported from the re-measurement only.
 
-### Steady-state resource use (secure, real 9-workload cluster)
+### Steady-state resource use (secure, 2-node testbed)
 
 | | CPU | Memory (working set / RSS) |
 | --- | --- | --- |
