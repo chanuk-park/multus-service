@@ -13,6 +13,8 @@ METRICS = [
     ("recv->apply    c1->c2", "c1", "c2"),
     ("apply->patch   c2->c3", "c2", "c3"),
     ("report->slice  c1->c3", "c1", "c3"),
+    ("patch write    c3->c4", "c3", "c4"),
+    ("recv->written  c1->c4", "c1", "c4"),
     ("failure->slice t0->c3", "t0", "c3"),
     ("failure->DNS   t0->t6", "t0", "t6"),
 ]
@@ -38,11 +40,15 @@ def col(rows,x,y):
     p=lambda q: v[min(len(v)-1,int(round((len(v)-1)*q)))]
     return (p(0.5), p(0.95), len(v))
 
+if len(sys.argv) != 3:
+    sys.exit("usage: compare-convergence.py SECURE.jsonl INSECURE.jsonl")
 sec=load(sys.argv[1]); ins=load(sys.argv[2])
 print("secure n=%d valid, insecure n=%d valid\n" % (len(sec),len(ins)))
-print("%-24s %18s %18s %10s" % ("interval (ms)","insecure med/p95","secure med/p95","Δ median"))
+print("%-24s %24s %24s %10s" % ("interval (ms)","G2 off med/p95 (n)","G2 on med/p95 (n)","Δ median"))
 for name,x,y in METRICS:
-    im,ip,_=col(ins,x,y); sm,sp,_=col(sec,x,y)
+    im,ip,inn=col(ins,x,y); sm,sp,sn=col(sec,x,y)
     d = (sm-im) if (im is not None and sm is not None) else None
-    fmt=lambda a,b: ("%7.2f /%7.2f"%(a,b)) if a is not None else "     n/a"
-    print("%-24s %18s %18s %10s" % (name, fmt(im,ip), fmt(sm,sp), ("%+.2f"%d) if d is not None else "n/a"))
+    # n is printed per interval: a missing anchor must show up as a smaller n,
+    # never be hidden behind a single "n valid" header.
+    fmt=lambda a,b,n: ("%7.2f /%7.2f (%2d)"%(a,b,n)) if a is not None else "     n/a"
+    print("%-24s %24s %24s %10s" % (name, fmt(im,ip,inn), fmt(sm,sp,sn), ("%+.2f"%d) if d is not None else "n/a"))

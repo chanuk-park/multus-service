@@ -165,14 +165,24 @@ while time.time() < end:
 PY
 
 ALOG=$(mktemp); CLOG=$(mktemp); DLOG=$(mktemp); RESULTS=${RESULTS:-$(mktemp)}
-kubectl -n "$CTRL_NS" logs -f "$(agent_pod)" --tail=0 > "$ALOG" 2>/dev/null & ALOG_PID=$!
-kubectl -n "$CTRL_NS" logs -f deploy/multus-service-controller --tail=0 > "$CLOG" 2>/dev/null & CLOG_PID=$!
+# `kubectl logs -f` stops following when the container log is rotated, which
+# silently drops the controller anchors for every later run. Re-attach a dead
+# follower before each run (appending), and let the parser reject any run whose
+# controller anchors are missing instead of counting it as valid.
+follow_agent() { kubectl -n "$CTRL_NS" logs -f "$(agent_pod)" --since="${1:-1s}" >> "$ALOG" 2>/dev/null & ALOG_PID=$!; }
+follow_ctrl()  { kubectl -n "$CTRL_NS" logs -f deploy/multus-service-controller --since="${1:-1s}" >> "$CLOG" 2>/dev/null & CLOG_PID=$!; }
+ensure_followers() {
+  kill -0 "$ALOG_PID" 2>/dev/null || { echo "  [re-attach agent log]"; follow_agent 30s; }
+  kill -0 "$CLOG_PID" 2>/dev/null || { echo "  [re-attach controller log]"; follow_ctrl 30s; }
+}
+follow_agent; follow_ctrl
 RUNTIME=$(( N * 22 + 40 ))
 kubectl -n "$NS" exec dnsprobe -- python3 -u /tmp/w.py "$SVC.$NS.svc.cluster.local" "$RUNTIME" 0.05 > "$DLOG" 2>/dev/null & DNS_PID=$!
 sleep 3
 
 echo
 for i in $(seq 1 "$N"); do
+  ensure_followers; sleep 1
   T0=$(python3 -c 'import time;print(int(time.time()*1e9))')
   sudo -n nsenter --net="$NSPATH" ip link set net1 down
   sleep 9

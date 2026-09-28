@@ -133,7 +133,14 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 		var env *healthpb.HealthEnvelope
 		select {
 		case <-ctx.Done():
-			s.Events.Emit("stream_revoked", "node", node, "pod_uid", agent.PodUID)
+			// ctx ends on revocation and also when the client goes away (e.g.
+			// its max-session cap). With producer authentication off there is
+			// no agent identity, so do not dereference it.
+			podUID := ""
+			if agent != nil {
+				podUID = agent.PodUID
+			}
+			s.Events.Emit("stream_revoked", "node", node, "pod_uid", podUID)
 			return status.Error(codes.Unauthenticated, "session revoked")
 		case err := <-recvErr:
 			if err == io.EOF {

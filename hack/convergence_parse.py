@@ -75,6 +75,12 @@ def run(a):
         problems.append("no detection")
     if t6 is None:
         problems.append("no DNS withdrawal")
+    # A run without the controller's anchors cannot contribute to the
+    # controller-side intervals; counting it as valid silently shrinks n for
+    # exactly the intervals the security comparison is about.
+    for n, v in (("c1", c1), ("c2", c2), ("c3", c3)):
+        if v is None:
+            problems.append("no controller anchor %s" % n)
     order = [("t0", t0), ("a1", a1), ("a2", a2), ("c1", c1), ("c2", c2), ("c3", c3), ("t6", t6)]
     known = [(n, v) for n, v in order if v is not None]
     for (n1, v1), (n2, v2) in zip(known, known[1:]):

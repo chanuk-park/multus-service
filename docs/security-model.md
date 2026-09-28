@@ -239,27 +239,48 @@ regardless of report volume: authentication is O(stream establishment), not
 O(report). The session cap exists only to bound how stale a rotated bearer token
 can be (the token is presented once per streaming RPC, not per message).
 
-### Critical-path overhead: G2 on vs off (`hack/measure-convergence.sh`, n≈30 each)
+### Critical-path overhead: G2 on vs off (`hack/measure-convergence.sh`, n=30 each)
 
-Same datapath, `--require-agent-auth` toggled. All values ms, median / p95:
+Same datapath, `--require-agent-auth` toggled, both arms measured back to back in
+one session on the same controller build. All values ms, median / p95:
 
 | Interval | Unprotected (G2 off) | Secure (G2 on) | Δ median |
 | --- | --- | --- | --- |
-| agent detect `t0->a1` | 127.3 / 135.2 | 126.7 / 141.4 | -0.55 |
-| transport `a2->c1` | 0.62 / 1.24 | 0.63 / 2.63 | +0.01 |
-| recv->apply `c1->c2` | 0.08 / 0.39 | 0.08 / 0.45 | +0.00 |
-| apply->patch `c2->c3` | 0.81 / 1.29 | 0.72 / 1.14 | -0.09 |
-| **report->slice `c1->c3`** | 0.90 / 1.68 | **0.86 / 1.62** | **-0.03** |
-| failure->slice `t0->c3` | 127.3 / 136.8 | 129.7 / 144.2 | +2.45 |
-| failure->DNS `t0->t6` | 1669 / 4145 | 1656 / 4182 | -13.0 |
+| agent detect `t0->a1` | 40.1 / 48.8 | 41.7 / 50.8 | +1.57 |
+| transport `a2->c1` | 0.58 / 1.12 | 0.62 / 1.70 | +0.04 |
+| recv->apply `c1->c2` | 0.10 / 0.48 | 0.08 / 0.28 | -0.02 |
+| apply->patch `c2->c3` | 0.79 / 3.26 | 0.74 / 1.38 | -0.05 |
+| **recv->patch issued `c1->c3`** | 0.91 / 3.39 | **0.89 / 1.42** | **-0.03** |
+| patch write `c3->c4` (API server) | 7.99 / 10.98 | 8.05 / 14.96 | +0.06 |
+| recv->written `c1->c4` | 8.97 / 13.64 | 9.11 / 15.82 | +0.13 |
+| failure->slice `t0->c3` | 42.7 / 50.2 | 43.8 / 53.1 | +1.16 |
+| failure->DNS `t0->t6` | 2329 / 4675 | 2313 / 4720 | -16.2 |
 
-Every delta is smaller than its own metric's run-to-run spread, so **no
+`c1->c3` is the controller's own processing -- receipt to the EndpointSlice patch
+being issued -- and contains every step G2 adds. `c1->c4` adds the API-server
+write, which G2 does not touch; its p95 difference comes from that write
+(`c3->c4`), not from the security checks.
+
+Every median delta is smaller than its own metric's run-to-run spread, so **no
 measurable incremental steady-state overhead from G2 was observed under this
 testbed workload** (a negative median delta means below the experimental noise,
 not a real speed-up). This is expected: authentication happens once at stream
 setup, not per report, so the steady-state datapath is the same node-string
 compare either way. DNS-withdrawal variance was dominated by CoreDNS caching
 under the default 5 s TTL in both arms.
+
+**Correction to an earlier version of this table.** The first G2-off arm had
+only 14 runs with controller anchors, not ~30: with producer authentication off
+the controller dereferenced a nil agent identity when a stream ended
+(`health_server.go`, `stream_revoked`) and crashed at every agent `--max-session`
+rollover (300 s). Each crash dropped the harness's log follower, so later runs
+lost their controller events, and the parser still counted them as valid. The
+panic is fixed (regression test `TestUnauthenticatedStreamEndDoesNotPanic`), the
+harness re-attaches a dead log follower, the parser rejects runs without
+controller anchors, the comparison prints n per interval, and both arms were
+re-measured. The conclusion is unchanged; the absolute detection and DNS numbers
+differ from the first run (detection ~40 ms vs ~127 ms, DNS median ~2.3 s vs
+~1.7 s) and are reported from the re-measurement only.
 
 ### Steady-state resource use (secure, real 9-workload cluster)
 
@@ -277,7 +298,7 @@ Producer-bound endpoint authorization costs one TokenReview (~3.5 ms median) at
 each stream establishment. No measurable incremental steady-state overhead was
 observed under this testbed workload: the publication and withdrawal critical
 path is unchanged, and failure convergence is dominated by netlink detection
-(~130 ms) and CoreDNS caching (default 5 s TTL), not by the security checks. The
+(~40 ms) and CoreDNS caching (default 5 s TTL), not by the security checks. The
 authority restoration that blocks the A1/A2 and G3 attacks imposes no
 steady-state cost we could measure on the endpoint-management path; its cost is
 confined to session establishment and to recovery after an agent is replaced
@@ -307,16 +328,28 @@ recreation rather than by the checks.
 
 ## Result: G3 stale-generation / replay (`hack/attack-g3.sh`)
 
-Each attacker authenticates as a *legitimate* node agent (a valid Pod-bound
-token), so producer authorization (G2) has already passed. What is under test is
-whether evidence from a superseded generation can take effect.
+Each attacker authenticates as a *legitimate* node agent: the harness mints a
+token bound to the real agent Pod, so producer authorization (G2) has already
+passed. This is deliberately stronger than the external attacker of the threat
+model, who cannot pass G2 at all. The G3 adversary it stands for is a leaked
+agent credential used within its lifetime, or a superseded agent / attachment
+generation whose reports are still in flight. What is under test is whether
+evidence from a superseded generation can take effect.
+
+Four scenarios, six checks (R1 is checked twice -- nothing applied, and refused
+as unknown -- and the victim is checked to be unaffected after R2/R2').
 
 | # | Attack | Mechanism that blocks it | Result |
 | --- | --- | --- | --- |
 | R1 | replay a deleted Pod's old `attachment_id` after recreate | `attachment_id = hash(PodUID\|NAD\|iface\|IP)` + Registry membership | old id refused as unknown; 0 applied |
 | R2 | roll a sequence backwards within one instance | per-instance monotonic sequence | rejected: sequence did not advance |
 | R2' | a superseded agent instance keeps sending | instance adoption + `ErrStaleInstance` | rejected: superseded agent instance |
-| R3 | hold an endpoint alive with stale keep-alive after the agent is parked | receive-time lease (`accepted_at` + TTL) | endpoint ages out to not-ready |
+| R3 | hold an endpoint alive with stale keep-alive after the agent is parked | keep-alive: the token is bound to the removed agent Pod, so the stream is refused at G2; last accepted state: receive-time lease (`accepted_at` + TTL) | keep-alive refused; endpoint withdrawn on lease expiry |
+
+R3 is not a defence *by* the lease: the attacker's keep-alive is already
+refused by G2 once the Pod its token is bound to is gone. What the lease adds is
+liveness of withdrawal -- the last legitimately accepted healthy state does not
+outlive the evidence that supported it.
 
 R1 is the sharpest: because the id is bound to the Pod UID, a recreated Pod
 gets a new attachment generation, and the old id has no authority over it. The
@@ -333,9 +366,10 @@ restored within a few seconds of the old one being revoked.
   cross-node, session revocation, re-adopt), and `hack/attack-spoof.sh` (A1/A2
   now blocked, 0 unauthorized accepted).
 - **G3 reproduced and verified**: `hack/attack-g3.sh` (R1 attachment replay,
-  R2 sequence rollback, R2' stale instance, R3 lease expiry) -- each stale
-  generation refused, endpoint ages out.
+  R2 sequence rollback, R2' stale instance, R3 keep-alive after agent removal)
+  -- four scenarios, six checks; each stale generation refused, and the last
+  accepted state withdrawn on lease expiry.
 - **RQ3 measured**: connection-time TokenReview ~3.5 ms median (node binding
   ~1 us), amortized to ~0 per report; G2 on-vs-off critical-path overhead within
-  noise (report->slice Δ -0.03 ms, below experimental spread); steady-state
+  noise (recv->patch Δ -0.03 ms, recv->written Δ +0.13 ms, both below experimental spread; n=30 per arm after re-measurement); steady-state
   controller ~6 m CPU / ~12-49 MB. No measurable steady-state overhead from G2.
