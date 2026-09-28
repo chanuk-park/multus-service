@@ -55,6 +55,7 @@ def stats(key):
     return "min=%.3f  median=%.3f  p95=%.3f  max=%.3f ms" % (v[0], p(0.5), p(0.95), v[-1])
 print("n=%d authenticated establishments captured (of %s requested)" % (len(rows), sys.argv[2]))
 print("  TokenReview        %s" % stats("tokenreview_us"))
+print("  SubjectAccessRev.  %s" % stats("accessreview_us"))
 print("  Pod/registry look  %s" % stats("pod_lookup_us"))
 print("  Total auth         %s" % stats("auth_total_us"))
 PY

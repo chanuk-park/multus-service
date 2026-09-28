@@ -35,6 +35,12 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
+  # Ask RBAC whether the authenticated identity may report health. Who may
+  # report is a ClusterRole binding (below), not a name compiled into the
+  # controller.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
   # Read-only: used to validate that the referenced NAD exists.
   - apiGroups: ["k8s.cni.cncf.io"]
     resources: ["network-attachment-definitions"]
@@ -113,6 +119,32 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: multus-service-agent
+subjects:
+  - kind: ServiceAccount
+    name: multus-service-agent
+    namespace: multus-service-system
+---
+# Producer authority as RBAC: the virtual resource healthreports is never stored;
+# the controller checks this permission with a SubjectAccessReview when a stream
+# opens. Binding it to another ServiceAccount is how an operator would grant (or,
+# by removing the binding, revoke) the right to report health.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: multus-service-health-reporter
+rules:
+  - apiGroups: ["secondary-service.boanlab.io"]
+    resources: ["healthreports"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: multus-service-health-reporter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: multus-service-health-reporter
 subjects:
   - kind: ServiceAccount
     name: multus-service-agent

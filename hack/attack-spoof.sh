@@ -7,9 +7,11 @@
 # after G2 the same attacker is refused at the transport. The script reports the
 # numbers either way -- it is the before/after figure for the paper.
 #
-# ATTACKER=strong additionally hands the attacker the controller CA and a valid
-# but NON-agent token, to show it is producer authorization (G2), not merely TLS
-# or possessing some token, that blocks it.
+# ATTACKER=strong gives the attacker what any Pod creator has: the controller CA
+# (public) and a valid Pod-bound token for the controller's audience, projected
+# by its own Pod spec on the victim's node. Run against --auth-mode none, token
+# and full to separate "no authentication", "authentication only" and producer
+# authorization (G2).
 set -u
 
 NS=${NS:-ms-attack}
@@ -128,19 +130,28 @@ if [ "$ATTACKER" = "strong" ]; then
   CA=/tmp/spoof-ca.crt
   kubectl -n "$CTRL_NS" get configmap controller-ca -o jsonpath='{.data.ca\.crt}' > "$CA" 2>/dev/null || true
   if [ -s "$CA" ]; then SPOOF_TLS=(--ca "$CA" --server-name "$SERVER_NAME"); echo "  attacker HAS the controller CA (it is not a secret)"; fi
-  # a valid, non-agent pod-bound token for an ordinary workload on this node
+  # An ordinary workload obtains a valid Pod-bound token for the controller's
+  # audience with no special permission: it declares a projected token volume in
+  # its own Pod spec, and it schedules itself onto the victim's node. Nobody
+  # mints anything for it.
   kubectl -n "$NS" create sa intruder >/dev/null 2>&1 || true
   cat <<EOP | kubectl apply -f - >/dev/null 2>&1
 apiVersion: v1
 kind: Pod
 metadata: {name: intruder, namespace: $NS}
-spec: {serviceAccountName: intruder, nodeName: $NODE, containers: [{name: sh, image: docker.io/library/busybox:1.36, command: ["sh","-c","sleep infinity"]}]}
+spec:
+  serviceAccountName: intruder
+  nodeSelector: {kubernetes.io/hostname: $NODE}
+  containers: [{name: sh, image: docker.io/library/busybox:1.36, command: ["sh","-c","sleep infinity"],
+                volumeMounts: [{name: tok, mountPath: /var/run/attack}]}]
+  volumes:
+    - name: tok
+      projected: {sources: [{serviceAccountToken: {audience: health-controller, expirationSeconds: 3600, path: token}}]}
 EOP
   retry 120 '[ "$(k get pod intruder -o jsonpath="{.status.phase}" 2>/dev/null)" = "Running" ]' >/dev/null
-  IUID=$(k get pod intruder -o jsonpath='{.metadata.uid}')
   TOKF=/tmp/spoof-token
-  kubectl -n "$NS" create token intruder --bound-object-kind Pod --bound-object-name intruder --bound-object-uid "$IUID" --audience health-controller --duration 1h > "$TOKF" 2>/dev/null || true
-  if [ -s "$TOKF" ]; then SPOOF_TOK=(--token "$TOKF"); echo "  attacker HAS a valid non-agent token (audience health-controller)"; fi
+  k exec intruder -- cat /var/run/attack/token > "$TOKF" 2>/dev/null || true
+  if [ -s "$TOKF" ]; then SPOOF_TOK=(--token "$TOKF"); echo "  attacker HAS its own projected token (audience health-controller, SA intruder, on $NODE)"; fi
 fi
 spoof() { ( cd "$ROOT" && go run ./test/tools/spoof "${SPOOF_TLS[@]}" "${SPOOF_TOK[@]}" "$@" ); }
 retry 30 'bash -c "exec 3<>/dev/tcp/${CTRL_ADDR%:*}/9090" 2>/dev/null' && ok "any workload can reach the transport; no NetworkPolicy, no credential" || bad "transport unreachable"

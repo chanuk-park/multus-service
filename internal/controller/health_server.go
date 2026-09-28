@@ -87,6 +87,7 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 			"pod", agent.PodName, "namespace", agent.Namespace,
 			"service_account", agent.ServiceAccount, "node", node, "pod_uid", agent.PodUID,
 			"tokenreview_us", timing.TokenReview.Microseconds(),
+			"accessreview_us", timing.AccessReview.Microseconds(),
 			"pod_lookup_us", timing.PodLookup.Microseconds(),
 			"auth_total_us", timing.Total.Microseconds())
 	}

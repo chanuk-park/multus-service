@@ -150,8 +150,9 @@ kubectl -n "$NS" create token ordinary --bound-object-kind Pod --bound-object-na
 spoof --addr "$CTRL_ADDR" --ca "$CA" --server-name "$SERVER_NAME" --token /tmp/p5-ordinary.tok --node "$NODE_A" \
   --attachment "$AID" --nad "$NS/sec-p5" --interface net1 --ip "$VIP" --attack withdraw --duration 4s >/dev/null 2>&1 || true
 sleep 1
-if clog 20s | grep '"event":"stream_rejected"' | tail -1 | grep -q 'not a registered node agent'; then
-  ok "an authenticated but non-agent workload is refused by the AgentRegistry"
+# Refused by RBAC (no health-report grant) or, failing that, by the AgentRegistry.
+if clog 20s | grep '"event":"stream_rejected"' | tail -1 | grep -qE 'not authorized to report health|not a registered node agent'; then
+  ok "an authenticated but non-agent workload is refused ($(clog 20s | grep '"event":"stream_rejected"' | tail -1 | grep -o '"reason":"[^:]*'))"
 else
   bad "non-agent token not rejected" "$(clog 20s | grep stream_rejected | tail -1)"
 fi

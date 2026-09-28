@@ -25,6 +25,33 @@ The security question is therefore not "how do we move a Service to net1" but:
 > **which subject, presenting which evidence, may make or unmake a secondary
 > address a resolvable endpoint of a Service?**
 
+## Threat model
+
+**Trust boundary.** The API server (authentication, RBAC, TokenReview,
+SubjectAccessReview), the controller, each node's kernel and container runtime,
+and the administrators of the agent namespace. The last one is not optional:
+anyone who can create Pods in `multus-service-system` can run a Pod as the agent
+ServiceAccount, and nothing in Kubernetes distinguishes that Pod from an agent --
+the same namespace boundary Kubernetes itself relies on.
+
+Three threats, each with the property that answers it:
+
+| | Who | Capabilities | Property |
+| --- | --- | --- | --- |
+| **T1** | a workload attacker: any principal that can create Pods, or a compromised workload | projects a Pod-bound token with **any audience** in its own Pod spec; schedules itself onto any node, including the victim's; holds the (public) controller CA; reaches the report endpoint. No EndpointSlice write permission | evidence cannot create membership (G1); authenticating is not authority -- the identity must hold an RBAC grant and be a live agent Pod (G2) |
+| **T2** | one compromised node (host or agent) | everything that node's agent holds | the damage stays on that node: a node's producer can only change endpoints on that node (G2 node binding). Its lies about its **own** endpoints are out of scope, as a kubelet's are for Kubernetes -- this is the NodeRestriction property, applied to health evidence |
+| **T3** | a previous generation (not necessarily an attacker) | a superseded agent instance still sending after a rolling update or partition; a recreated Pod's old attachment; a token leaked within its lifetime | fencing: evidence from a superseded generation cannot change current state (G3) |
+
+**Impact is availability.** G1 held even in the unprotected baseline, so T1
+cannot insert its own address and redirect traffic; it can withdraw a live
+endpoint (A1) or keep a dead one published (A2). That is the difference from
+CVE-2021-25740, which let the holder of endpoint write permission redirect
+traffic across namespaces.
+
+**Out of scope.** Compromise of the control plane or of the agent namespace;
+a compromised node lying about its own endpoints; diagnosing why a probe fails;
+denial of service against the controller itself.
+
 ## Demonstrated attacks (`hack/attack-spoof.sh`)
 
 The agent→controller transport is plain gRPC on a ClusterIP, reachable by any
@@ -206,6 +233,34 @@ audience:
 Rejection reason: `authenticated workload is not a registered node agent`. A
 valid token is not authority to report health — only a registered agent's is.
 
+## Baseline strength: no authentication, authentication only, G2 (`--auth-mode`)
+
+A fair question about the result above: is the vulnerable baseline just an
+unauthenticated endpoint? So the same T1 attacker was run against three
+controller modes, one session, same fixtures (`docs/data/attack-modes.log`):
+
+- `none`: no producer authentication (the node is the envelope's).
+- `token`: what a reasonable first implementation would do -- TokenReview with
+  the controller's audience, a Pod-bound token required, the node taken from the
+  token's own node-name claim. Authenticated, not authorized.
+- `full`: G2 -- TokenReview, then RBAC (a SubjectAccessReview for
+  `create healthreports.secondary-service.boanlab.io`, granted only to the agent
+  ServiceAccount), then the live agent Pod and `Pod.spec.nodeName`.
+
+The attacker is an ordinary Pod (ServiceAccount `intruder`, no RBAC grants) on
+the victim's node, which declares a projected token with audience
+`health-controller` in its own spec. Nobody minted anything for it.
+
+| DNS presence of the victim | `none` | `token` | `full` |
+| --- | --- | --- | --- |
+| before the attack | 7/7 | 6/6 | 6/6 |
+| A1 during forged withdrawal (live endpoint) | **0/15** | **0/15** | 14/14 |
+| A2 during forged keep-alive (dead endpoint) | **14/15** | **13/14** | 0/14 |
+
+Authentication alone does not help: the attacker's own token passes TokenReview
+and carries the right node. Under `full` the stream is refused with
+`identity is not authorized to report health: system:serviceaccount:ms-attack:intruder`.
+
 ## RQ3: cost of producer-bound authorization
 
 The primary comparison toggles **G2 only**. G1 (Registry) and G3 (attachment /
@@ -221,14 +276,18 @@ cost measured is exactly producer authentication/authorization:
 
 ### Connection-time cost (`hack/measure-auth-establishment.sh`, n=100)
 
+With RBAC in the path (`docs/data/auth-establishment.jsonl`):
+
 | Stage | min | median | p95 | max |
 | --- | --- | --- | --- | --- |
-| TokenReview (Kubernetes API round trip) | 1.73 | **3.46** | 4.71 | 17.6 ms |
-| Pod / AgentRegistry lookup (in-memory) | 0.000 | **0.001** | 0.002 | 0.04 ms |
-| Total authentication | 1.74 | **3.46** | 4.73 | 17.6 ms |
+| TokenReview (API round trip) | 1.52 | **3.31** | 4.37 | 10.1 ms |
+| SubjectAccessReview (API round trip) | 1.27 | **2.95** | 4.42 | 12.7 ms |
+| Pod / AgentRegistry lookup (in-memory) | 0.000 | **0.001** | 0.002 | 0.03 ms |
+| Total authentication | 2.87 | **6.18** | 8.21 | 22.8 ms |
 
-The whole cost is the one TokenReview round trip; the node-binding lookup is a
-map read (~1 microsecond). This is paid once per stream, not per report.
+Two API round trips, paid once per stream, not per report. (Before the RBAC step
+was added the total was TokenReview alone, 3.46 / 4.71 ms;
+`auth-establishment-pre-rbac.jsonl`.)
 
 ### Authentication is amortized (`hack/measure-auth-frequency.sh`)
 
@@ -242,7 +301,9 @@ can be (the token is presented once per streaming RPC, not per message).
 ### Critical-path overhead: G2 on vs off (`hack/measure-convergence.sh`, n=30 each)
 
 Same datapath, `--require-agent-auth` toggled, both arms measured back to back in
-one session on the same controller build. All values ms, median / p95:
+one session on the same controller build. This build predates the RBAC step; the
+SubjectAccessReview runs only when a stream is established, next to the
+TokenReview, so it does not enter the per-report path measured here. All values ms, median / p95:
 
 | Interval | Unprotected (G2 off) | Secure (G2 on) | Δ median |
 | --- | --- | --- | --- |
@@ -313,14 +374,15 @@ DaemonSet Pod + projected token -> TokenReview + AgentRegistry -> new stream ->
 
 | Interval | median | p95 |
 | --- | --- | --- |
-| revoke -> authenticated stream | 1220 | 1716 ms |
-| authenticated stream -> snapshot commit | 988 | 995 ms |
-| **agent deletion -> endpoint ready** | **2715** | 2937 ms |
+| revoke -> authenticated stream | 1257 | 1338 ms |
+| authenticated stream -> snapshot commit | 985 | 991 ms |
+| **agent deletion -> endpoint ready** | **2793** | 2941 ms |
 
-User-visible recovery is ~2.7 s, and it is dominated by ordinary Kubernetes
+(Re-measured with the RBAC step; before it: 1220 / 988 / 2715 ms,
+`recovery-pre-rbac.jsonl`.) User-visible recovery is ~2.8 s, and it is dominated by ordinary Kubernetes
 mechanics -- the kubelet recreating the DaemonSet Pod and the first refresh-driven
 snapshot (~1 s) -- not by the security handoff: the revoke + re-auth path is a
-small share, and the TokenReview inside it is the 3.5 ms already measured. So the
+small share, and the TokenReview + SubjectAccessReview inside it is the ~6 ms already measured. So the
 security session lifecycle -- revoke a stale generation immediately, admit only
 the new one, resync atomically -- closes the availability side too: authority is
 handed off and readiness is restored within a few seconds, bounded by Pod

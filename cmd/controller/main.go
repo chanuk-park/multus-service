@@ -48,6 +48,7 @@ func main() {
 		agentLabel  string
 		tlsDir      string
 		requireAuth bool
+		authMode    string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "liveness/readiness endpoint")
@@ -72,6 +73,10 @@ func main() {
 	flag.StringVar(&tlsDir, "tls-dir", "/etc/multus-service/tls",
 		"directory holding tls.crt and tls.key for the health transport; "+
 			"empty serves plaintext (never in production)")
+	flag.StringVar(&authMode, "auth-mode", "full",
+		"producer authorization: full = TokenReview + RBAC (SubjectAccessReview) + live agent Pod + "+
+			"node from Pod.spec.nodeName; token = TokenReview + audience only, node from the token's claim "+
+			"(baseline: authenticated but not authorized); none = no producer authentication (baseline)")
 	flag.BoolVar(&requireAuth, "require-agent-auth", true,
 		"require producer authentication/authorization (G2): TokenReview + AgentRegistry + "+
 			"node binding. false keeps TLS, the Registry (G1) and instance/sequence/lease (G3) "+
@@ -127,13 +132,29 @@ func main() {
 		setupLog.Error(err, "building TokenReview client")
 		os.Exit(1)
 	}
-	authn := &controller.K8sAuthenticator{
-		Client:               authClient,
-		Audience:             healthAud,
-		Agents:               agents,
-		ExpectNamespace:      agentNS,
-		ExpectServiceAccount: agentSA,
+	// --require-agent-auth=false predates --auth-mode; it still means "none".
+	if !requireAuth {
+		authMode = "none"
 	}
+	var authn controller.Authenticator
+	switch authMode {
+	case "full":
+		authn = &controller.K8sAuthenticator{
+			Client:               authClient,
+			Audience:             healthAud,
+			Agents:               agents,
+			ExpectNamespace:      agentNS,
+			ExpectServiceAccount: agentSA,
+			Authorize:            true,
+		}
+	case "token":
+		authn = &controller.TokenAuthenticator{Client: authClient, Audience: healthAud}
+	case "none":
+	default:
+		setupLog.Error(nil, "--auth-mode must be full, token or none", "value", authMode)
+		os.Exit(1)
+	}
+	setupLog.Info("producer authorization", "auth-mode", authMode)
 
 	if err := (&controller.AgentPodReconciler{
 		Client:   mgr.GetClient(),
@@ -178,7 +199,7 @@ func main() {
 			Events:      events,
 			Auth:        authn,
 			Sessions:    sessions,
-			RequireAuth: requireAuth,
+			RequireAuth: authMode != "none",
 			Notify:      r.Enqueue,
 		},
 	}); err != nil {
@@ -208,7 +229,7 @@ func main() {
 
 	events.Emit("controller_started",
 		"health_ttl_ms", healthTTL.Milliseconds(), "health_addr", healthAddr,
-		"health_audience", healthAud, "tls", tlsCert != "", "require_agent_auth", requireAuth)
+		"health_audience", healthAud, "tls", tlsCert != "", "auth_mode", authMode)
 	setupLog.Info("starting controller", "healthTTL", healthTTL, "healthAddr", healthAddr)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "manager exited")

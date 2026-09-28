@@ -1,0 +1,140 @@
+################ auth-mode=none
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-28T09:54:43Z	INFO	setup	producer authorization	{"auth-mode": "none"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.13 attachment=ee6f78c5336698c8 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 7/7
+
+[1mA1  Availability: forge local_ready=false for a LIVE endpoint[0m
+  [31mNOT SEEN[0m controller APPLIED a forged report (attack succeeded)
+  victim DNS presence over 12s WHILE attacker runs: 0/15
+  [31mNOT SEEN[0m victim was withdrawn (attack succeeded)
+  attacker: attack=withdraw sends=380 accepted_acks=17
+  unauthorized reports accepted (must be 0): 0
+
+[1mA2  Integrity/blackhole: keep a DEAD path published[0m
+  killing the health target so the real path is genuinely down
+  [32mOBSERVED[0m legitimately withdrawn once the path failed (real agent, honest)
+  now forging healthy evidence for the dead endpoint:
+  victim DNS presence over 12s WHILE attacker forges health (path is dead): 14/15
+  [31mNOT SEEN[0m DEAD endpoint kept in DNS by forgery (attack succeeded)
+  attacker: attack=keepalive sends=380 accepted_acks=17
+
+[1mG1  Non-creation: forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published -- non-creation holds
+
+[1msummary[0m
+  A1 forged withdrawal of a live endpoint:  see presence fraction above
+  A2 forged keep-alive of a dead endpoint:  see presence fraction above
+  G1 non-creation:                          already enforced by the Registry
+
+  The gap both A1 and A2 exploit: the controller trusts envelope.node and
+  the newest stream wins. Node identity is self-asserted, so any workload
+  that can reach the transport can speak for any node's endpoints.
+
+[1mcleanup[0m
+################ end none
+################ auth-mode=token
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-28T09:57:25Z	INFO	setup	producer authorization	{"auth-mode": "token"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.14 attachment=167c7ed811c8f345 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  Availability: forge local_ready=false for a LIVE endpoint[0m
+  [31mNOT SEEN[0m controller APPLIED a forged report (attack succeeded)
+  victim DNS presence over 12s WHILE attacker runs: 0/15
+  [31mNOT SEEN[0m victim was withdrawn (attack succeeded)
+  attacker: attack=withdraw sends=380 accepted_acks=17
+  unauthorized reports accepted (must be 0): 0
+
+[1mA2  Integrity/blackhole: keep a DEAD path published[0m
+  killing the health target so the real path is genuinely down
+  [32mOBSERVED[0m legitimately withdrawn once the path failed (real agent, honest)
+  now forging healthy evidence for the dead endpoint:
+  victim DNS presence over 12s WHILE attacker forges health (path is dead): 13/14
+  [31mNOT SEEN[0m DEAD endpoint kept in DNS by forgery (attack succeeded)
+  attacker: attack=keepalive sends=380 accepted_acks=17
+
+[1mG1  Non-creation: forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published -- non-creation holds
+
+[1msummary[0m
+  A1 forged withdrawal of a live endpoint:  see presence fraction above
+  A2 forged keep-alive of a dead endpoint:  see presence fraction above
+  G1 non-creation:                          already enforced by the Registry
+
+  The gap both A1 and A2 exploit: the controller trusts envelope.node and
+  the newest stream wins. Node identity is self-asserted, so any workload
+  that can reach the transport can speak for any node's endpoints.
+
+[1mcleanup[0m
+################ end token
+################ auth-mode=full
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-28T10:00:07Z	INFO	setup	producer authorization	{"auth-mode": "full"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.15 attachment=10729bef2a25c95d iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  Availability: forge local_ready=false for a LIVE endpoint[0m
+  [32mOBSERVED[0m no forged report applied for the victim attachment
+  [32mOBSERVED[0m attacker stream rejected at the transport ("reason":"identity is not authorized to report health: system:serviceaccount:ms-attack:intruder")
+  victim DNS presence over 12s WHILE attacker runs: 14/14
+  [32mOBSERVED[0m victim stayed in Service DNS throughout -- forged withdrawal had no effect
+  attacker: attack=withdraw sends=0 accepted_acks=0
+  unauthorized reports accepted (must be 0): 0
+
+[1mA2  Integrity/blackhole: keep a DEAD path published[0m
+  killing the health target so the real path is genuinely down
+  [32mOBSERVED[0m legitimately withdrawn once the path failed (real agent, honest)
+  now forging healthy evidence for the dead endpoint:
+  victim DNS presence over 12s WHILE attacker forges health (path is dead): 0/14
+  [32mOBSERVED[0m dead endpoint stayed withdrawn -- forged healthy evidence had no effect
+  attacker: attack=keepalive sends=0 accepted_acks=0
+
+[1mG1  Non-creation: forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published -- non-creation holds
+
+[1msummary[0m
+  A1 forged withdrawal of a live endpoint:  see presence fraction above
+  A2 forged keep-alive of a dead endpoint:  see presence fraction above
+  G1 non-creation:                          already enforced by the Registry
+
+  The gap both A1 and A2 exploit: the controller trusts envelope.node and
+  the newest stream wins. Node identity is self-asserted, so any workload
+  that can reach the transport can speak for any node's endpoints.
+
+[1mcleanup[0m
+################ end full
+ATTACK-MODES-DONE
+deployment.apps/multus-service-controller patched (no change)
+deployment "multus-service-controller" successfully rolled out
+2026-09-28T10:00:07Z	INFO	setup	producer authorization	{"auth-mode": "full"}
