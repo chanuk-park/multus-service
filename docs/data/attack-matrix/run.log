@@ -1,0 +1,468 @@
+################ auth-mode=none rep=1
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T06:56:46Z	INFO	setup	producer authorization	{"auth-mode": "none"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.17 attachment=c47f49bd823fbd15 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 0/15
+  attacker: attack=withdraw sends=380 accepted_acks=17
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 0/14
+  attacker: attack=withdraw sends=386 accepted_acks=16
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 7/15
+  attacker: attack=keepalive sends=380 accepted_acks=17
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=none rep=1 a1_presence=0/15 a1_applied=187 a1_takeover=4 a1_reject=report_from_a_superseded_agent_instance t2_presence=0/14 t2_applied=191 t2_takeover=3 t2_reject=report_from_a_superseded_agent_instance a2_presence=7/15 a2_applied=187 a2_takeover=4 a2_reject=unknown_path_key g1=refused
+
+[1mcleanup[0m
+################ end none 1
+################ auth-mode=token rep=1
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T06:59:44Z	INFO	setup	producer authorization	{"auth-mode": "token"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.18 attachment=68726907257668e8 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 7/15
+  attacker: attack=withdraw sends=380 accepted_acks=17
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 14/14
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 15/16
+  attacker: attack=keepalive sends=380 accepted_acks=17
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=token rep=1 a1_presence=7/15 a1_applied=187 a1_takeover=4 a1_reject=report_from_a_superseded_agent_instance t2_presence=14/14 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=15/16 a2_applied=187 a2_takeover=4 a2_reject=unknown_path_key g1=refused
+
+[1mcleanup[0m
+################ end token 1
+################ auth-mode=token-sa rep=1
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:02:55Z	INFO	setup	producer authorization	{"auth-mode": "token-sa"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.19 attachment=758be632ae04574b iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 15/15
+  attacker: attack=withdraw sends=0 accepted_acks=0
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 14/14
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 0/15
+  attacker: attack=keepalive sends=0 accepted_acks=0
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=token-sa rep=1 a1_presence=15/15 a1_applied=0 a1_takeover=0 a1_reject=identity_is_not_authorized_to_report_health t2_presence=14/14 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=0/15 a2_applied=0 a2_takeover=0 a2_reject=identity_is_not_authorized_to_report_health g1=refused
+
+[1mcleanup[0m
+################ end token-sa 1
+################ auth-mode=full rep=1
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:05:51Z	INFO	setup	producer authorization	{"auth-mode": "full"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.20 attachment=86b0900d5811445a iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 7/7
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 15/15
+  attacker: attack=withdraw sends=0 accepted_acks=0
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 14/14
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 0/14
+  attacker: attack=keepalive sends=0 accepted_acks=0
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=full rep=1 a1_presence=15/15 a1_applied=0 a1_takeover=0 a1_reject=identity_is_not_authorized_to_report_health t2_presence=14/14 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=0/14 a2_applied=0 a2_takeover=0 a2_reject=identity_is_not_authorized_to_report_health g1=refused
+
+[1mcleanup[0m
+################ end full 1
+################ auth-mode=none rep=2
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:08:58Z	INFO	setup	producer authorization	{"auth-mode": "none"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.21 attachment=80fe7907a7e34db6 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 0/15
+  attacker: attack=withdraw sends=380 accepted_acks=17
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 0/14
+  attacker: attack=withdraw sends=392 accepted_acks=15
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 14/15
+  attacker: attack=keepalive sends=380 accepted_acks=17
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=none rep=2 a1_presence=0/15 a1_applied=187 a1_takeover=4 a1_reject=report_from_a_superseded_agent_instance t2_presence=0/14 t2_applied=195 t2_takeover=2 t2_reject=report_from_a_superseded_agent_instance a2_presence=14/15 a2_applied=187 a2_takeover=4 a2_reject=unknown_path_key g1=refused
+
+[1mcleanup[0m
+################ end none 2
+################ auth-mode=token rep=2
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:12:16Z	INFO	setup	producer authorization	{"auth-mode": "token"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.22 attachment=5884a6301d6d219a iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 7/15
+  attacker: attack=withdraw sends=380 accepted_acks=17
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 14/14
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 13/14
+  attacker: attack=keepalive sends=380 accepted_acks=17
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=token rep=2 a1_presence=7/15 a1_applied=187 a1_takeover=4 a1_reject=report_from_a_superseded_agent_instance t2_presence=14/14 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=13/14 a2_applied=187 a2_takeover=4 a2_reject=unknown_path_key g1=refused
+
+[1mcleanup[0m
+################ end token 2
+################ auth-mode=token-sa rep=2
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:15:25Z	INFO	setup	producer authorization	{"auth-mode": "token-sa"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.23 attachment=39ae58a0bcf77d84 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 15/15
+  attacker: attack=withdraw sends=0 accepted_acks=0
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 15/15
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 0/14
+  attacker: attack=keepalive sends=0 accepted_acks=0
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=token-sa rep=2 a1_presence=15/15 a1_applied=0 a1_takeover=0 a1_reject=identity_is_not_authorized_to_report_health t2_presence=15/15 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=0/14 a2_applied=0 a2_takeover=0 a2_reject=identity_is_not_authorized_to_report_health g1=refused
+
+[1mcleanup[0m
+################ end token-sa 2
+################ auth-mode=full rep=2
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:18:31Z	INFO	setup	producer authorization	{"auth-mode": "full"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.24 attachment=6c7c6791af7012d7 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 15/15
+  attacker: attack=withdraw sends=0 accepted_acks=0
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 14/14
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 0/14
+  attacker: attack=keepalive sends=0 accepted_acks=0
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=full rep=2 a1_presence=15/15 a1_applied=0 a1_takeover=0 a1_reject=identity_is_not_authorized_to_report_health t2_presence=14/14 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=0/14 a2_applied=0 a2_takeover=0 a2_reject=identity_is_not_authorized_to_report_health g1=refused
+
+[1mcleanup[0m
+################ end full 2
+################ auth-mode=none rep=3
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:21:34Z	INFO	setup	producer authorization	{"auth-mode": "none"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.25 attachment=4a85e1874b0820c2 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 7/15
+  attacker: attack=withdraw sends=380 accepted_acks=17
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 0/15
+  attacker: attack=withdraw sends=392 accepted_acks=14
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 14/15
+  attacker: attack=keepalive sends=380 accepted_acks=17
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=none rep=3 a1_presence=7/15 a1_applied=187 a1_takeover=4 a1_reject=report_from_a_superseded_agent_instance t2_presence=0/15 t2_applied=195 t2_takeover=2 t2_reject=report_from_a_superseded_agent_instance a2_presence=14/15 a2_applied=187 a2_takeover=4 a2_reject=unknown_path_key g1=refused
+
+[1mcleanup[0m
+################ end none 3
+################ auth-mode=token rep=3
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:24:45Z	INFO	setup	producer authorization	{"auth-mode": "token"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.26 attachment=06eae95186343224 iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 0/15
+  attacker: attack=withdraw sends=380 accepted_acks=17
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 14/14
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 15/16
+  attacker: attack=keepalive sends=380 accepted_acks=17
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=token rep=3 a1_presence=0/15 a1_applied=187 a1_takeover=4 a1_reject=report_from_a_superseded_agent_instance t2_presence=14/14 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=15/16 a2_applied=187 a2_takeover=4 a2_reject=unknown_path_key g1=refused
+
+[1mcleanup[0m
+################ end token 3
+################ auth-mode=token-sa rep=3
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:27:56Z	INFO	setup	producer authorization	{"auth-mode": "token-sa"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.27 attachment=5540804825ceae0e iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 6/6
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 15/15
+  attacker: attack=withdraw sends=0 accepted_acks=0
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 15/15
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 0/15
+  attacker: attack=keepalive sends=0 accepted_acks=0
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=token-sa rep=3 a1_presence=15/15 a1_applied=0 a1_takeover=0 a1_reject=identity_is_not_authorized_to_report_health t2_presence=15/15 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=0/15 a2_applied=0 a2_takeover=0 a2_reject=identity_is_not_authorized_to_report_health g1=refused
+
+[1mcleanup[0m
+################ end token-sa 3
+################ auth-mode=full rep=3
+deployment.apps/multus-service-controller patched
+Waiting for deployment "multus-service-controller" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "multus-service-controller" rollout to finish: 1 old replicas are pending termination...
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:31:00Z	INFO	setup	producer authorization	{"auth-mode": "full"}
+
+[1msetup: healthy victim endpoint, published the legitimate way[0m
+  victim ip=10.216.0.28 attachment=b621876f9600510f iface=net1 node=telco-guard-01
+  controller transport reachable at 10.43.83.77:9090 (server-name multus-service-controller.multus-service-system.svc)
+  attacker HAS the controller CA (it is not a secret)
+  attacker HAS its own projected token (audience health-controller, SA intruder, on telco-guard-01)
+  [32mOBSERVED[0m any workload can reach the transport; no NetworkPolicy, no credential
+  baseline DNS over 5s (no attacker):
+    victim present: 7/7
+
+[1mA1  forge local_ready=false for a LIVE endpoint (T1: own projected token)[0m
+  victim DNS presence WHILE attacker runs: 15/15
+  attacker: attack=withdraw sends=0 accepted_acks=0
+
+[1mT2  a compromised node B: node-B agent credential, forging for a node-A endpoint[0m
+  attacker holds multus-service-agent-w5vj4's credential (node telco-guard-02); victim is on telco-guard-01
+  victim DNS presence WHILE node-B credential forges: 15/15
+  attacker: attack=withdraw sends=398 accepted_acks=399
+
+[1mA2  keep a DEAD path published (T1)[0m
+  [32mOBSERVED[0m legitimately withdrawn once the path failed
+  victim DNS presence WHILE attacker forges health (path is dead): 0/15
+  attacker: attack=keepalive sends=0 accepted_acks=0
+
+[1mG1  forgery cannot invent an endpoint[0m
+  [32mOBSERVED[0m invented address never published
+
+[1msummary[0m
+RESULT mode=full rep=3 a1_presence=15/15 a1_applied=0 a1_takeover=0 a1_reject=identity_is_not_authorized_to_report_health t2_presence=15/15 t2_applied=0 t2_takeover=1 t2_reject=unknown_path_key a2_presence=0/15 a2_applied=0 a2_takeover=0 a2_reject=identity_is_not_authorized_to_report_health g1=refused
+
+[1mcleanup[0m
+################ end full 3
+ATTACK-MATRIX-DONE
+deployment.apps/multus-service-controller patched (no change)
+deployment "multus-service-controller" successfully rolled out
+2026-09-29T07:31:00Z	INFO	setup	producer authorization	{"auth-mode": "full"}

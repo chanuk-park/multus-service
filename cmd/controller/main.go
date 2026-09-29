@@ -76,7 +76,8 @@ func main() {
 	flag.StringVar(&authMode, "auth-mode", "full",
 		"producer authorization: full = TokenReview + RBAC (SubjectAccessReview) + live agent Pod + "+
 			"node from Pod.spec.nodeName; token = TokenReview + audience only, node from the token's claim "+
-			"(baseline: authenticated but not authorized); none = no producer authentication (baseline)")
+			"(baseline: authenticated but not authorized); token-sa = token plus an exact ServiceAccount check "+
+			"(baseline: what a careful implementation adds); none = no producer authentication (baseline)")
 	flag.BoolVar(&requireAuth, "require-agent-auth", true,
 		"require producer authentication/authorization (G2): TokenReview + AgentRegistry + "+
 			"node binding. false keeps TLS, the Registry (G1) and instance/sequence/lease (G3) "+
@@ -149,9 +150,12 @@ func main() {
 		}
 	case "token":
 		authn = &controller.TokenAuthenticator{Client: authClient, Audience: healthAud}
+	case "token-sa":
+		authn = &controller.TokenAuthenticator{Client: authClient, Audience: healthAud,
+			ExpectUser: "system:serviceaccount:" + agentNS + ":" + agentSA}
 	case "none":
 	default:
-		setupLog.Error(nil, "--auth-mode must be full, token or none", "value", authMode)
+		setupLog.Error(nil, "--auth-mode must be full, token-sa, token or none", "value", authMode)
 		os.Exit(1)
 	}
 	setupLog.Info("producer authorization", "auth-mode", authMode)

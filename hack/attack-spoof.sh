@@ -153,78 +153,108 @@ EOP
   k exec intruder -- cat /var/run/attack/token > "$TOKF" 2>/dev/null || true
   if [ -s "$TOKF" ]; then SPOOF_TOK=(--token "$TOKF"); echo "  attacker HAS its own projected token (audience health-controller, SA intruder, on $NODE)"; fi
 fi
-spoof() { ( cd "$ROOT" && go run ./test/tools/spoof "${SPOOF_TLS[@]}" "${SPOOF_TOK[@]}" "$@" ); }
+SPOOFBIN=/tmp/spoof-bin
+( cd "$ROOT" && go build -o "$SPOOFBIN" ./test/tools/spoof ) || { bad "cannot build spoof tool"; exit 1; }
+spoof() { "$SPOOFBIN" "${SPOOF_TLS[@]}" "${SPOOF_TOK[@]}" "$@"; }
+# The whole controller event stream for this run, parsed per window at the end.
+MODE=${MODE:-unknown}; REP=${REP:-0}
+CLOG=${CLOG:-/tmp/attack-ctrl-$MODE-$REP.log}
+CPOD=$(kubectl -n "$CTRL_NS" get pod -l app="$CTRL" --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.creationTimestamp} {.metadata.name}{"\n"}{end}' | sort | tail -1 | awk '{print $2}')
+kubectl -n "$CTRL_NS" logs -f "$CPOD" --since=5s > "$CLOG" 2>/dev/null & CLOG_PID=$!
+now(){ date +%s%N; }
 retry 30 'bash -c "exec 3<>/dev/tcp/${CTRL_ADDR%:*}/9090" 2>/dev/null' && ok "any workload can reach the transport; no NetworkPolicy, no credential" || bad "transport unreachable"
 
 echo "  baseline DNS over 5s (no attacker):"
 echo "    victim present: $(dns_presence 5)"
 
 # ---------------------------------------------------------------- A1
-head_ "A1  Availability: forge local_ready=false for a LIVE endpoint"
-spoof --addr "$CTRL_ADDR" --node "$NODE" \
+head_ "A1  forge local_ready=false for a LIVE endpoint (T1: own projected token)"
+A1_T0=$(now)
+spoof --addr "$CTRL_ADDR" --node "$NODE" --instance attacker-a1 \
     --attachment "$AID" --nad "$NS/sec-victim" --interface "$IFACE" --ip "$VIP" \
     --attack withdraw --duration 20s > /tmp/spoof_a1.log 2>&1 &
 SP=$!
-sleep 3
-if kubectl -n "$CTRL_NS" logs deploy/"$CTRL" --since=30s 2>/dev/null \
-   | grep '"event":"health_report_applied"' | grep "\"attachment_id\":\"$AID\"" | tail -1 | grep -q '"local_ready":false'; then
-  bad "controller APPLIED a forged report (attack succeeded)"
-else
-  ok "no forged report applied for the victim attachment"
-fi
-if kubectl -n "$CTRL_NS" logs deploy/"$CTRL" --since=30s 2>/dev/null | grep -q '"event":"stream_rejected"'; then
-  ok "attacker stream rejected at the transport ($(kubectl -n "$CTRL_NS" logs deploy/"$CTRL" --since=30s 2>/dev/null | grep '"event":"stream_rejected"' | tail -1 | grep -o '"reason":"[^"]*"'))"
-fi
-echo "  victim DNS presence over 12s WHILE attacker runs: $(dns_presence 12)"
-if dns | grep -q "^$VIP$"; then
-  ok "victim stayed in Service DNS throughout -- forged withdrawal had no effect"
-else
-  bad "victim was withdrawn (attack succeeded)"
-fi
-wait $SP 2>/dev/null; tail -1 /tmp/spoof_a1.log | sed 's/^/  attacker: /'
-echo "  unauthorized reports accepted (must be 0): $(kubectl -n "$CTRL_NS" logs deploy/"$CTRL" --since=30s 2>/dev/null | grep -c '"event":"health_report_applied".*"attachment_id":"'"$AID"'".*"local_ready":false')"
+sleep 4
+A1_P=$(dns_presence 12)
+echo "  victim DNS presence WHILE attacker runs: $A1_P"
+wait $SP 2>/dev/null; A1_T1=$(now); tail -1 /tmp/spoof_a1.log | sed 's/^/  attacker: /'
+retry 90 'dns | grep -q "^$VIP$"' >/dev/null || bad "victim did not return after A1"
+
+# ---------------------------------------------------------------- T2
+head_ "T2  a compromised node B: node-B agent credential, forging for a node-A endpoint"
+OTHER=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -v "^$NODE$" | head -1)
+APOD=$(kubectl -n "$CTRL_NS" get pod -l app=multus-service-agent --field-selector spec.nodeName="$OTHER" -o jsonpath='{.items[0].metadata.name}')
+AUID=$(kubectl -n "$CTRL_NS" get pod "$APOD" -o jsonpath='{.metadata.uid}')
+TOKB=/tmp/spoof-token-nodeb
+kubectl -n "$CTRL_NS" create token multus-service-agent --bound-object-kind Pod --bound-object-name "$APOD" \
+  --bound-object-uid "$AUID" --audience health-controller --duration 1h > "$TOKB" 2>/dev/null
+echo "  attacker holds $APOD's credential (node $OTHER); victim is on $NODE"
+T2_T0=$(now)
+"$SPOOFBIN" "${SPOOF_TLS[@]}" --token "$TOKB" --addr "$CTRL_ADDR" --node "$NODE" --instance attacker-t2 \
+    --attachment "$AID" --nad "$NS/sec-victim" --interface "$IFACE" --ip "$VIP" \
+    --attack withdraw --duration 20s > /tmp/spoof_t2.log 2>&1 &
+SP=$!
+sleep 4
+T2_P=$(dns_presence 12)
+echo "  victim DNS presence WHILE node-B credential forges: $T2_P"
+wait $SP 2>/dev/null; T2_T1=$(now); tail -1 /tmp/spoof_t2.log | sed 's/^/  attacker: /'
+retry 90 'dns | grep -q "^$VIP$"' >/dev/null || bad "victim did not return after T2"
 
 # ---------------------------------------------------------------- A2
-head_ "A2  Integrity/blackhole: keep a DEAD path published"
-echo "  killing the health target so the real path is genuinely down"
+head_ "A2  keep a DEAD path published (T1)"
 k delete pod tgt --wait=true >/dev/null 2>&1
-retry 90 '! dns | grep -q "^$VIP$"' && ok "legitimately withdrawn once the path failed (real agent, honest)" \
-  || { bad "endpoint did not withdraw on real failure"; }
-echo "  now forging healthy evidence for the dead endpoint:"
-spoof --addr "$CTRL_ADDR" --node "$NODE" \
+retry 90 '! dns | grep -q "^$VIP$"' && ok "legitimately withdrawn once the path failed" || bad "endpoint did not withdraw on real failure"
+A2_T0=$(now)
+spoof --addr "$CTRL_ADDR" --node "$NODE" --instance attacker-a2 \
     --attachment "$AID" --nad "$NS/sec-victim" --interface "$IFACE" --ip "$VIP" \
     --attack keepalive --duration 20s > /tmp/spoof_a2.log 2>&1 &
 SP=$!
 sleep 4
-echo "  victim DNS presence over 12s WHILE attacker forges health (path is dead): $(dns_presence 12)"
-if dns | grep -q "^$VIP$"; then
-  bad "DEAD endpoint kept in DNS by forgery (attack succeeded)"
-else
-  ok "dead endpoint stayed withdrawn -- forged healthy evidence had no effect"
-fi
-wait $SP 2>/dev/null; tail -1 /tmp/spoof_a2.log | sed 's/^/  attacker: /'
+A2_P=$(dns_presence 12)
+echo "  victim DNS presence WHILE attacker forges health (path is dead): $A2_P"
+wait $SP 2>/dev/null; A2_T1=$(now); tail -1 /tmp/spoof_a2.log | sed 's/^/  attacker: /'
 
-# ---------------------------------------------------------------- G1 sanity
-head_ "G1  Non-creation: forgery cannot invent an endpoint"
-# Post-G2 a non-agent is refused before the app layer, so non-creation now holds
-# at two layers: the transport rejects the producer, and even an authenticated
-# agent's report for an unknown attachment is refused by the Registry (exercised
-# in test/e2e/phase5.sh). Here we confirm the invented address never appears.
-spoof --addr "$CTRL_ADDR" --node "$NODE" \
+# ---------------------------------------------------------------- G1
+head_ "G1  forgery cannot invent an endpoint"
+spoof --addr "$CTRL_ADDR" --node "$NODE" --instance attacker-g1 \
   --attachment deadbeefdeadbeef --nad "$NS/sec-victim" --interface net1 --ip 10.255.255.1 \
   --attack keepalive --duration 6s >/dev/null 2>&1 || true
 sleep 2
 if k get endpointslice "$SLICE" -o jsonpath='{.endpoints[*].addresses[0]}' 2>/dev/null | grep -q '10.255.255.1'; then
-  bad "an invented address appeared in the slice"
+  G1R=published; bad "an invented address appeared in the slice"
 else
-  ok "invented address never published -- non-creation holds"
+  G1R=refused; ok "invented address never published"
 fi
+sleep 1; kill $CLOG_PID 2>/dev/null
 
+# ---------------------------------------------------------------- per-window accounting from the controller log
 head_ "summary"
-echo "  A1 forged withdrawal of a live endpoint:  see presence fraction above"
-echo "  A2 forged keep-alive of a dead endpoint:  see presence fraction above"
-echo "  G1 non-creation:                          already enforced by the Registry"
-echo
-echo "  The gap both A1 and A2 exploit: the controller trusts envelope.node and"
-echo "  the newest stream wins. Node identity is self-asserted, so any workload"
-echo "  that can reach the transport can speak for any node's endpoints."
+python3 - "$CLOG" "$AID" "$MODE" "$REP" "$A1_T0" "$A1_T1" "$T2_T0" "$T2_T1" "$A2_T0" "$A2_T1" \
+  "$A1_P" "$T2_P" "$A2_P" "$G1R" <<'PY'
+import json, sys
+log, aid, mode, rep = sys.argv[1:5]
+w = {"a1": (int(sys.argv[5]), int(sys.argv[6])), "t2": (int(sys.argv[7]), int(sys.argv[8])),
+     "a2": (int(sys.argv[9]), int(sys.argv[10]))}
+pres = dict(zip(("a1", "t2", "a2"), sys.argv[11:14])); g1 = sys.argv[14]
+ev = []
+for line in open(log, errors="ignore"):
+    line = line.strip()
+    if line.startswith("{"):
+        try: ev.append(json.loads(line))
+        except ValueError: pass
+out = ["RESULT", "mode=%s" % mode, "rep=%s" % rep]
+for k, (t0, t1) in w.items():
+    E = [e for e in ev if t0 <= e.get("ts", 0) <= t1 + 2_000_000_000]
+    atk = "attacker-" + k
+    applied = sum(1 for e in E if e.get("event") == "health_report_applied"
+                  and e.get("attachment_id") == aid and str(e.get("agent_instance", "")).startswith(atk))
+    takeover = sum(1 for e in E if e.get("event") == "agent_connected"
+                   and str(e.get("agent_instance", "")).startswith(atk) and e.get("superseded"))
+    rej = [e.get("reason", "") for e in E if e.get("event") == "stream_rejected"]
+    nrej = [e.get("reason", "") for e in E if e.get("event") == "health_report_rejected"]
+    reason = (rej[-1] if rej else (nrej[-1] if nrej else "-")).split(":")[0].replace(" ", "_")
+    out += ["%s_presence=%s" % (k, pres[k]), "%s_applied=%d" % (k, applied), "%s_takeover=%d" % (k, takeover),
+            "%s_reject=%s" % (k, reason)]
+out.append("g1=%s" % g1)
+print(" ".join(out))
+PY

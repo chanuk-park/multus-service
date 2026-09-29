@@ -233,33 +233,47 @@ audience:
 Rejection reason: `authenticated workload is not a registered node agent`. A
 valid token is not authority to report health — only a registered agent's is.
 
-## Baseline strength: no authentication, authentication only, G2 (`--auth-mode`)
+## Baseline strength: four modes, three runs each (`--auth-mode`)
 
-A fair question about the result above: is the vulnerable baseline just an
-unauthenticated endpoint? So the same T1 attacker was run against three
-controller modes, one session, same fixtures (`docs/data/attack-modes.log`):
+Is the vulnerable baseline just an unauthenticated endpoint? The same attacks
+were run against four controller modes, three times each
+(`docs/data/attack-matrix/`, one controller log per run):
 
 - `none`: no producer authentication (the node is the envelope's).
-- `token`: what a reasonable first implementation would do -- TokenReview with
-  the controller's audience, a Pod-bound token required, the node taken from the
-  token's own node-name claim. Authenticated, not authorized.
-- `full`: G2 -- TokenReview, then RBAC (a SubjectAccessReview for
-  `create healthreports.secondary-service.boanlab.io`, granted only to the agent
-  ServiceAccount), then the live agent Pod and `Pod.spec.nodeName`.
+- `token`: TokenReview + audience + Pod-bound token, node from the token's
+  node-name claim. Authenticated, not authorized.
+- `token-sa`: `token` plus an exact ServiceAccount check -- what a careful
+  implementation adds without RBAC.
+- `full`: G2 -- TokenReview, RBAC (SubjectAccessReview), live agent Pod,
+  `Pod.spec.nodeName`.
 
-The attacker is an ordinary Pod (ServiceAccount `intruder`, no RBAC grants) on
-the victim's node, which declares a projected token with audience
-`health-controller` in its own spec. Nobody minted anything for it.
+T1 attacker: an ordinary Pod (SA `intruder`, no grants) on the victim's node that
+projects its own token with audience `health-controller`. T2: the attacker holds
+the node-B agent's token and forges for a node-A endpoint. Each cell: victim DNS
+presence during the attack · forged reports applied (range over 3 runs).
 
-| DNS presence of the victim | `none` | `token` | `full` |
+| mode | A1 withdraw live (T1) | T2 node-B credential | A2 keep dead (T1) |
 | --- | --- | --- | --- |
-| before the attack | 7/7 | 6/6 | 6/6 |
-| A1 during forged withdrawal (live endpoint) | **0/15** | **0/15** | 14/14 |
-| A2 during forged keep-alive (dead endpoint) | **14/15** | **13/14** | 0/14 |
+| `none` | 0-47% · 187 | 0% · 191-195 | 47-93% · 187 |
+| `token` | 0-47% · 187 | 100% · 0 | 93-94% · 187 |
+| `token-sa` | 100% · 0 | 100% · 0 | 0% · 0 |
+| `full` | 100% · 0 | 100% · 0 | 0% · 0 |
 
-Authentication alone does not help: the attacker's own token passes TokenReview
-and carries the right node. Under `full` the stream is refused with
-`identity is not authorized to report health: system:serviceaccount:ms-attack:intruder`.
+- **Authentication alone does nothing against T1**: the attacker's own token
+  passes TokenReview and carries the victim's node.
+- **The attacker takes the generation**: under `none`/`token` its stream
+  superseded the real agent's instance 4 times per run, so the real agent's
+  reports were refused as superseded. G3 fencing means something only when G2
+  limits who may start a generation.
+- **The identity check is what stops T1**: `token-sa` and `full` gave the same
+  result in these attacks. What `full` adds is expressing that authority as RBAC
+  instead of a name compiled into the controller, and defence in depth (the live
+  agent Pod check) inside the trust boundary. The mechanisms are the ones
+  Kubernetes applies to kubelets; the contribution is separating, by
+  measurement, which check stops which threat.
+- **T2 is confined, not prevented**: every mode but `none` bound the node-B
+  credential to node B, but that credential's stream superseded node B's own
+  agent instance once per run -- damage confined to the compromised node.
 
 ## RQ3: cost of producer-bound authorization
 

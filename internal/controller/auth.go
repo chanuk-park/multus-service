@@ -189,6 +189,10 @@ func (a *K8sAuthenticator) Authenticate(ctx context.Context, token string) (agen
 type TokenAuthenticator struct {
 	Client   kubernetes.Interface
 	Audience string
+	// ExpectUser, when set, additionally requires the authenticated identity to
+	// be exactly this ServiceAccount (system:serviceaccount:<ns>:<name>) -- the
+	// check a careful implementation would add without RBAC or a live-Pod check.
+	ExpectUser string
 }
 
 // Authenticate implements Authenticator for the baseline.
@@ -198,6 +202,9 @@ func (a *TokenAuthenticator) Authenticate(ctx context.Context, token string) (ag
 	res, podUID, err := reviewToken(ctx, a.Client, a.Audience, token, &t)
 	if err != nil {
 		return nil, t, err
+	}
+	if a.ExpectUser != "" && res.Status.User.Username != a.ExpectUser {
+		return nil, t, fmt.Errorf("%w: %s", ErrNotAuthorized, res.Status.User.Username)
 	}
 	node := firstExtra(res.Status.User.Extra, extraNodeName)
 	if node == "" {

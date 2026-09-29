@@ -233,7 +233,7 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 				"epoch", epoch, "local", len(bufLocal), "path", len(bufPath),
 				"moved", len(moved))
 			for _, r := range moved {
-				s.Events.Emit("health_report_applied",
+				s.Events.Emit("health_report_applied", "agent_instance", instance,
 					"attachment_id", r.AttachmentID, "kind", "local",
 					"via", "snapshot", "local_ready", r.Ready())
 			}
@@ -270,7 +270,7 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 				}
 				continue
 			}
-			s.Events.Emit("health_report_applied",
+			s.Events.Emit("health_report_applied", "agent_instance", instance,
 				"attachment_id", r.AttachmentID, "kind", "local",
 				"via", "delta", "local_ready", r.Ready())
 			s.notify(owners)
@@ -300,14 +300,14 @@ func (s *HealthServer) Sync(stream healthpb.HealthReporter_SyncServer) error {
 				}
 				continue
 			}
-			s.Events.Emit("health_report_applied",
+			s.Events.Emit("health_report_applied", "agent_instance", instance,
 				"scope_id", r.ScopeID, "kind", "path", "path_ready", r.PathReady)
 			s.notify(owners)
 
 		case *healthpb.HealthEnvelope_Retired:
 			id := p.Retired.AttachmentId
 			s.Store.ForgetLocal(id)
-			s.Events.Emit("health_report_applied",
+			s.Events.Emit("health_report_applied", "agent_instance", instance,
 				"attachment_id", id, "kind", "retired")
 			if _, owners, ok := s.Registry.Attachment(id); ok {
 				s.notify(owners)

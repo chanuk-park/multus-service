@@ -91,3 +91,17 @@ func TestTokenModeAcceptsAnyPodOnItsNode(t *testing.T) {
 		t.Fatalf("node %q", ag.NodeName)
 	}
 }
+
+// The careful baseline: an exact ServiceAccount check refuses an ordinary Pod's
+// token and admits the agent's.
+func TestTokenSAModeChecksServiceAccount(t *testing.T) {
+	want := "system:serviceaccount:sys:agent"
+	a := &TokenAuthenticator{Client: fakeAPI("u9", "attacker:default", "node-a", false), Audience: "aud", ExpectUser: want}
+	if _, _, err := a.Authenticate(context.Background(), "tok"); !errors.Is(err, ErrNotAuthorized) {
+		t.Fatalf("want ErrNotAuthorized, got %v", err)
+	}
+	a = &TokenAuthenticator{Client: fakeAPI("u1", "sys:agent", "node-a", false), Audience: "aud", ExpectUser: want}
+	if ag, _, err := a.Authenticate(context.Background(), "tok"); err != nil || ag.NodeName != "node-a" {
+		t.Fatalf("agent refused: %v", err)
+	}
+}
