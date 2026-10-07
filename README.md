@@ -168,3 +168,7 @@ multus-service/
 | --- | --- |
 | [docs/security-model.md](docs/security-model.md) | Threat model, authority split, attack reproductions, cost measurements |
 | [docs/design.md](docs/design.md) | Implementation notes: netns resolution, path probe, health transport, events |
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
